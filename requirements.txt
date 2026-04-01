@@ -1,6 +1,6 @@
 streamlit
 ultralytics
-openvino>=2024.0.0
+openvino
 opencv-python-headless
 pandas
 numpy
