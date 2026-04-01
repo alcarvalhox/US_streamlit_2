@@ -1,7 +1,7 @@
 streamlit
+opencv-python-headless
 ultralytics
 openvino
-opencv-python-headless
 pandas
 numpy
 scipy
