@@ -38,7 +38,7 @@ from scipy.spatial import cKDTree
 # =====================================================================
 # Adequação 5: Título atualizado e ícone do navegador
 st.set_page_config(
-    page_title="Detecção de defeito de inspeção de US", 
+    page_title="Detecção de defeitos de inspeção de US", 
     page_icon="logo.png", 
     layout="wide"
 )
