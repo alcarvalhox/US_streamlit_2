@@ -37,7 +37,7 @@ from scipy.spatial import cKDTree
 # =====================================================================
 st.set_page_config(page_title="Sistema de Inspeção US - Coordenadoria", layout="wide")
 
-MODEL_DIR = "models"
+MODEL_DIR = "modelo"
 MODEL_PT = os.path.join(MODEL_DIR, "best_alma_1.pt")
 MODEL_OV = os.path.join(MODEL_DIR, "best_alma_1_openvino_model")
 LIMITES_DEPTH = {'alma': (53, 179)}
