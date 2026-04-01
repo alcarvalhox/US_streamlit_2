@@ -12,6 +12,8 @@ def install_dependencies():
             # Verifica se já rodamos a instalação nesta sessão para evitar loops
             if 'dependencies_installed' not in os.environ:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
+                # Garante a instalação do pacote necessário para gerar relatórios em Excel
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
                 os.environ['dependencies_installed'] = '1'
         except Exception as e:
             print(f"Erro ao instalar dependências: {e}")
@@ -25,7 +27,6 @@ import pandas as pd
 import numpy as np
 import cv2
 import io
-import shutil
 from ultralytics import YOLO
 from datetime import datetime
 import matplotlib.pyplot as plt
@@ -33,10 +34,65 @@ import seaborn as sns
 from scipy.spatial import cKDTree
 
 # =====================================================================
-# 1. CONFIGURAÇÕES E ESTILO
+# 1. CONFIGURAÇÕES, TÍTULO E ESTILO DA MRS LOGÍSTICA
 # =====================================================================
-st.set_page_config(page_title="Sistema de Inspeção US - Coordenadoria", layout="wide")
+# Adequação 5: Título atualizado e ícone do navegador
+st.set_page_config(
+    page_title="Detecção de defeito de inspeção de US", 
+    page_icon="logo.png", 
+    layout="wide"
+)
 
+# Adequação 3: Plano de fundo e cores corporativas (MRS)
+cores_mrs = """
+<style>
+/* Cor de fundo principal Azul Escuro */
+.stApp {
+    background-color: #003865;
+}
+/* Textos em branco para contraste */
+h1, h2, h3, p, label, .stMarkdown, .stText {
+    color: white !important;
+}
+/* Estilo dos Botões - Fundo Amarelo, Letra Azul */
+.stButton>button {
+    background-color: #FFC600;
+    color: #003865 !important;
+    font-weight: bold;
+    border: none;
+    border-radius: 5px;
+}
+/* Efeito ao passar o mouse nos botões */
+.stButton>button:hover {
+    background-color: #e6b300; 
+    color: white !important;
+}
+/* Deixar a tabela do Pandas legível com fundo branco */
+.stDataFrame {
+    background-color: white;
+    border-radius: 5px;
+}
+/* Cor do texto do Expander */
+.streamlit-expanderHeader {
+    color: #FFC600 !important;
+    font-weight: bold;
+}
+</style>
+"""
+st.markdown(cores_mrs, unsafe_allow_html=True)
+
+# Adequação 4: Logo no canto superior esquerdo e título alinhado
+col_logo, col_titulo = st.columns([1, 4])
+with col_logo:
+    try:
+        # Adequação 1 (Nome da logo): Busca o arquivo logo.png
+        st.image("logo.png", width=150)
+    except:
+        st.warning("⚠️ Arquivo 'logo.png' não encontrado na pasta principal.")
+with col_titulo:
+    st.title("Detecção de defeito de inspeção de US")
+
+# Configuração de Diretórios Corrigida para "modelo"
 MODEL_DIR = "modelo"
 MODEL_PT = os.path.join(MODEL_DIR, "best_alma_1.pt")
 MODEL_OV = os.path.join(MODEL_DIR, "best_alma_1_openvino_model")
@@ -51,7 +107,6 @@ if 'img_gallery' not in st.session_state:
 # 2. ROTINAS DE PARIDADE TOTAL (FILTRAGEM E CONVERSÃO)
 # =====================================================================
 def remover_pontos_isolados(df, raio=10):
-    """Etapa 5.5 original: Filtro espacial cKDTree."""
     if df.empty: return df
     coords = df[['odo', 'depth']].values
     tree = cKDTree(coords)
@@ -60,7 +115,6 @@ def remover_pontos_isolados(df, raio=10):
 
 @st.cache_resource
 def load_ov_model():
-    """Garante que o modelo esteja em formato OpenVINO para máxima economia."""
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
     
     if not os.path.exists(MODEL_OV):
@@ -70,12 +124,11 @@ def load_ov_model():
                 model.export(format="openvino", half=True)
                 s.update(label="Otimização Concluída!", state="complete")
         else:
-            st.error(f"Erro: Coloque o arquivo {MODEL_PT} na pasta /models")
+            st.error(f"Erro: Coloque o arquivo {MODEL_PT} na pasta /{MODEL_DIR}")
             return None
     return YOLO(MODEL_OV, task='detect')
 
 def generate_bscan_buffer(df_win, start, end):
-    """Reconstrução exata do padrão visual de treinamento (15x5 pol, 100 DPI)."""
     probe_colors = {0: 'yellow', 1: 'yellow', 6: 'green', 8: 'purple', 
                     4: 'red', 10: 'blue', 7: 'green', 9: 'purple', 5: 'red', 11: 'blue'}
     
@@ -96,22 +149,28 @@ def generate_bscan_buffer(df_win, start, end):
 # =====================================================================
 # 3. INTERFACE E CONTROLES
 # =====================================================================
-st.title("🔍 Painel de Controle de Manutenção - Visão Computacional")
+st.markdown("### Seleção de Dados")
 
-col_upload, col_reset, col_run = st.columns([2, 1, 1])
+col_upload, col_btn_run, col_btn_reset = st.columns([2, 1, 1])
 
 with col_upload:
-    files = st.file_uploader("Upload de CSVs", accept_multiple_files=True)
+    files = st.file_uploader("Faça o Upload dos arquivos CSV", accept_multiple_files=True)
 
-with col_reset:
+# Adequação 2: Troca da Posição dos Botões (Iniciar primeiro, Resetar depois)
+with col_btn_run:
+    # O botão fica alinhado com a caixa de upload
+    st.write("") 
+    st.write("")
+    btn_run = st.button("🚀 Iniciar Inferência", type="primary", use_container_width=True)
+
+with col_btn_reset:
+    st.write("") 
+    st.write("")
     if st.button("🗑️ Resetar Sistema", use_container_width=True):
         st.session_state.deteccoes = []
         st.session_state.img_gallery = []
         st.cache_resource.clear()
         st.rerun()
-
-with col_run:
-    btn_run = st.button("🚀 Iniciar Inferência", type="primary", use_container_width=True)
 
 # =====================================================================
 # 4. PROCESSAMENTO E INFERÊNCIA
@@ -119,29 +178,42 @@ with col_run:
 if btn_run and files:
     model = load_ov_model()
     if model:
-        # Ingestão e Preparação (Etapas 2, 3 e 4 originais)
+        # Adequação 1: Barra de progresso iniciada
+        progress_bar = st.progress(0.0, text="Iniciando a leitura dos arquivos CSV...")
+        
         df_raw = pd.concat([pd.read_csv(f) for f in files]).sort_values(by='odo')
         df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
         
-        # Separação e Filtro Nível > 450 (Rotina Original)
         df_esq = df_raw[df_raw['probe'].isin([0, 6, 8, 4, 10]) & (df_raw['level'] > 450)]
         df_dir = df_raw[df_raw['probe'].isin([1, 7, 9, 5, 11]) & (df_raw['level'] > 450)]
         
-        # Filtragem cKDTree (Etapa 5.5 original)
         df_esq = remover_pontos_isolados(df_esq)
         df_dir = remover_pontos_isolados(df_dir)
         
         found = []
         gallery = []
-        progress = st.progress(0)
         
         lados = [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
         
+        # Lógica para contar o total de passos da barra de progresso
+        total_steps = 0
+        for _, df_side in lados:
+            if not df_side.empty:
+                total_steps += len(range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400))
+        
+        passo_atual = 0
+
         for lado_nome, df_side in lados:
             if df_side.empty: continue
             
             steps = range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400)
-            for i, start in enumerate(steps):
+            for start in steps:
+                passo_atual += 1
+                
+                # Adequação 1: Atualização contínua da legenda
+                perc = min(passo_atual / total_steps, 1.0)
+                progress_bar.progress(perc, text=f"Analisando {lado_nome}: ODO {start}mm (Passo {passo_atual}/{total_steps})...")
+
                 end = start + 2400
                 df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
                 
@@ -150,26 +222,39 @@ if btn_run and files:
                     results = model.predict(img, verbose=False, conf=0.3)
                     
                     if len(results[0].boxes) > 0:
-                        # Salva para o Thumbnail (Máx 20)
-                        if len(gallery) < 20:
+                        if len(gallery) < 50:
                             gallery.append({"img": results[0].plot(), "label": f"{lado_nome} @ {start}"})
                         
-                        # Conversão Pixel -> MM (Rotina Inferencia Original)
                         h, w, _ = img.shape
                         for box in results[0].boxes:
                             bx = box.xyxy[0].cpu().numpy()
-                            px, py = ((bx[0]+bx[2])/2)/w, ((bx[1]+bx[3])/2)/h
+                            x1, y1, x2, y2 = bx
+                            
+                            # Adequação 4: Restauração do cálculo de comprimento exato
+                            px1, px2 = x1/w, x2/w
+                            py1, py2 = y1/h, y2/h
+                            
+                            x1_t = start + int(2400 * px1)
+                            x2_t = start + int(2400 * px2)
+                            y1_t = 53 + int(126 * py1)
+                            y2_t = 53 + int(126 * py2)
+                            
+                            center_x_mm = (x1_t + x2_t) / 2
+                            center_y_mm = (y1_t + y2_t) / 2
+                            comprimento = int(np.sqrt((x2_t - x1_t)**2 + (y2_t - y1_t)**2))
                             
                             found.append({
                                 'Lado': lado_nome,
-                                'ODO_Ref': start,
-                                'ODO_Real(mm)': int(start + (2400 * px)),
-                                'Prof_Real(mm)': int(53 + (126 * py)),
                                 'Classe': model.names[int(box.cls)],
+                                'ODO_Ref': start,
+                                'Coordenada ODO(mm)': int(center_x_mm),
+                                'Coordenada Depth(mm)': int(center_y_mm),
+                                'Comprimento(mm)': comprimento,
                                 'Confiança': f"{float(box.conf):.2%}"
                             })
-                progress.progress((i + 1) / len(steps))
         
+        # Finaliza a barra de progresso
+        progress_bar.progress(1.0, text=f"✅ Inferência concluída! {len(found)} defeitos encontrados.")
         st.session_state.deteccoes = found
         st.session_state.img_gallery = gallery
 
@@ -180,18 +265,32 @@ if st.session_state.deteccoes:
     st.divider()
     df_rep = pd.DataFrame(st.session_state.deteccoes)
     
-    # Download do Relatório Final
-    csv = df_rep.to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Baixar Relatório (CSV)", csv, f"relatorio_{datetime.now().strftime('%d%m%H%M')}.csv", "text/csv")
+    # Adequação 2: Conversão e Download do Relatório em EXCEL
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_rep.to_excel(writer, index=False, sheet_name='Defeitos_US')
+    excel_data = output.getvalue()
     
-    # Galeria de Thumbnails com expansão
-    st.subheader("🖼️ Detecções em Destaque (Thumbnail - Clique para ampliar)")
+    st.download_button(
+        label="📥 Baixar Relatório (Excel)", 
+        data=excel_data, 
+        file_name=f"relatorio_us_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+    
+    # Adequação 3: Thumbnails com link nativo de ida e volta (Expander)
+    st.subheader("🖼️ Detecções (Galeria de Imagens)")
+    st.markdown("*Dica: Clique na aba abaixo de cada Thumbnail para ver a imagem em tamanho real.*")
+    
     cols = st.columns(5)
     for idx, item in enumerate(st.session_state.img_gallery):
         with cols[idx % 5]:
-            with st.expander(f"ODO: {item['label'].split('@')[1]}"):
+            # Mostra a miniatura fora
+            st.image(item['img'], channels="BGR", use_container_width=True)
+            # Cria o "link de ida e volta" abrindo e fechando
+            with st.expander(f"🔎 Ampliar ODO: {item['label'].split('@')[1]}"):
                 st.image(item['img'], channels="BGR", use_container_width=True)
-            st.caption(item['label'])
-
+                st.caption(item['label'])
+            
     st.subheader("📋 Tabela Analítica")
     st.dataframe(df_rep, use_container_width=True)
