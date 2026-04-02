@@ -192,7 +192,7 @@ with col_botoes:
         st.rerun()
 
 # =====================================================================
-# 4. PROCESSAMENTO E INFERÊNCIA COM DESENHO CUSTOMIZADO
+# 4. PROCESSAMENTO E INFERÊNCIA COM FILTRO CUSTOMIZADO
 # =====================================================================
 if btn_run and arquivos_prontos:
     st.session_state.page = 0 
@@ -225,54 +225,87 @@ if btn_run and arquivos_prontos:
                 
                 if len(df_win) > 5:
                     img = generate_bscan_buffer(df_win, start, end)
-                    
-                    # --- NMS ULTRA-AGRESSIVO ---
-                    # iou=0.1: Se as caixas se sobrepuserem em 10%, a de menor confiança é apagada.
-                    # agnostic_nms=True: Apaga caixas duplicadas mesmo se forem de classes diferentes.
-                    results = model.predict(img, verbose=False, conf=0.3, iou=0.1, agnostic_nms=True)
+                    results = model.predict(img, verbose=False, conf=0.3)
                     
                     if len(results[0].boxes) > 0:
-                        img_draw = img.copy()
-                        h, w, _ = img.shape
-                        local_id = 1
-                        
+                        # --- PASSO 1: Extrair e ordenar predições por confiança ---
+                        raw_dets = []
                         for box in results[0].boxes:
-                            bx = box.xyxy[0].cpu().numpy()
-                            x1, y1, x2, y2 = bx.astype(int)
-                            classe_nome = model.names[int(box.cls)]
-                            
-                            cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                            texto = f"#{local_id} {classe_nome}"
-                            (w_txt, h_txt), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                            cv2.rectangle(img_draw, (x1, y1 - 25), (x1 + w_txt + 5, y1), (0, 0, 255), -1)
-                            cv2.putText(img_draw, texto, (x1 + 2, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                            
-                            px1, px2 = x1/w, x2/w
-                            py1, py2 = y1/h, y2/h
-                            center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
-                            center_y_mm = (53 + int(126 * py1) + 53 + int(126 * py2)) / 2
-                            comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(126 * py2) - int(126 * py1))**2))
-                            
-                            found.append({
-                                'ID_Global': len(found),
-                                'ID_Img': f"#{local_id}",
-                                'Lado': lado_nome,
-                                'Classe': classe_nome,
-                                'ODO_Ref': start,
-                                'Coordenada ODO(mm)': int(center_x_mm),
-                                'Coordenada Depth(mm)': int(center_y_mm),
-                                'Comprimento(mm)': comprimento,
-                                'Confiança': f"{float(box.conf):.2%}",
-                                'Aprovado': True
+                            bx = box.xyxy[0].cpu().numpy().astype(int)
+                            raw_dets.append({
+                                'box': bx,
+                                'conf': float(box.conf),
+                                'cls_nome': model.names[int(box.cls)]
                             })
-                            local_id += 1
+                        
+                        # Ordena da maior para a menor confiança
+                        raw_dets.sort(key=lambda x: x['conf'], reverse=True)
+
+                        # --- PASSO 2: Supressão Espacial Customizada (Deduplicação) ---
+                        final_dets = []
+                        RAIO_EXCLUSAO_PX = 30 # Distância mínima em pixels entre dois centros
+
+                        for d in raw_dets:
+                            x1, y1, x2, y2 = d['box']
+                            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                            duplicado = False
+
+                            for f in final_dets:
+                                fx1, fy1, fx2, fy2 = f['box']
+                                fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
+                                dist = np.sqrt((cx - fcx)**2 + (cy - fcy)**2)
+
+                                # Se o centro da caixa atual estiver muito perto de uma caixa já validada
+                                if dist < RAIO_EXCLUSAO_PX:
+                                    duplicado = True
+                                    break
+
+                            if not duplicado:
+                                final_dets.append(d)
+
+                        # --- PASSO 3: Desenhar e salvar apenas as caixas filtradas ---
+                        if final_dets:
+                            img_draw = img.copy()
+                            h, w, _ = img.shape
+                            local_id = 1
                             
-                        gallery.append({
-                            "img": img_draw, 
-                            "label": f"{lado_nome} @ {start}", 
-                            "odo_ref": start, 
-                            "lado": lado_nome
-                        })
+                            for d in final_dets:
+                                x1, y1, x2, y2 = d['box']
+                                classe_nome = d['cls_nome']
+                                conf_val = d['conf']
+                                
+                                cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                                texto = f"#{local_id} {classe_nome}"
+                                (w_txt, h_txt), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                                cv2.rectangle(img_draw, (x1, y1 - 25), (x1 + w_txt + 5, y1), (0, 0, 255), -1)
+                                cv2.putText(img_draw, texto, (x1 + 2, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                                
+                                px1, px2 = x1/w, x2/w
+                                py1, py2 = y1/h, y2/h
+                                center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
+                                center_y_mm = (53 + int(126 * py1) + 53 + int(126 * py2)) / 2
+                                comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(126 * py2) - int(126 * py1))**2))
+                                
+                                found.append({
+                                    'ID_Global': len(found),
+                                    'ID_Img': f"#{local_id}",
+                                    'Lado': lado_nome,
+                                    'Classe': classe_nome,
+                                    'ODO_Ref': start,
+                                    'Coordenada ODO(mm)': int(center_x_mm),
+                                    'Coordenada Depth(mm)': int(center_y_mm),
+                                    'Comprimento(mm)': comprimento,
+                                    'Confiança': f"{conf_val:.2%}",
+                                    'Aprovado': True
+                                })
+                                local_id += 1
+                                
+                            gallery.append({
+                                "img": img_draw, 
+                                "label": f"{lado_nome} @ {start}", 
+                                "odo_ref": start, 
+                                "lado": lado_nome
+                            })
         
         progress_bar.progress(1.0, text=f"✅ Inferência concluída! {len(found)} defeitos encontrados.")
         st.session_state.deteccoes = found
