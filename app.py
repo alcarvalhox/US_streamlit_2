@@ -151,15 +151,26 @@ with col_botoes:
     if st.button("🗑️ Resetar Sistema", use_container_width=True):
         st.session_state.deteccoes = []
         st.session_state.img_gallery = []
-        st.session_state.page = 0 # Reseta a página da galeria também
+        st.session_state.page = 0 
         st.cache_resource.clear()
         st.rerun()
+        
+    # === ADEQUAÇÃO 2: Tabela de Resumo abaixo do botão Resetar ===
+    if st.session_state.deteccoes:
+        st.markdown("<br>", unsafe_allow_html=True) # Espaçamento
+        st.markdown("##### 📊 Resumo de Detecções")
+        df_resumo_temp = pd.DataFrame(st.session_state.deteccoes)
+        # Conta a quantidade de cada classe
+        contagem_classes = df_resumo_temp['Classe'].value_counts().reset_index()
+        contagem_classes.columns = ['Classe de Defeito', 'Quantidade']
+        # Exibe a tabela sem o índice numérico lateral
+        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
 
 # =====================================================================
 # 4. PROCESSAMENTO E INFERÊNCIA
 # =====================================================================
 if btn_run and files:
-    st.session_state.page = 0 # Reseta a página sempre que iniciar nova inferência
+    st.session_state.page = 0 
     model = load_ov_model()
     if model:
         progress_bar = st.progress(0.0, text="Iniciando a leitura dos arquivos CSV...")
@@ -201,7 +212,6 @@ if btn_run and files:
                     results = model.predict(img, verbose=False, conf=0.3)
                     
                     if len(results[0].boxes) > 0:
-                        # Removido o limite de 50 imagens para permitir a paginação funcionar livremente
                         gallery.append({"img": results[0].plot(), "label": f"{lado_nome} @ {start}"})
                         
                         h, w, _ = img.shape
@@ -233,6 +243,7 @@ if btn_run and files:
         progress_bar.progress(1.0, text=f"✅ Inferência concluída! {len(found)} defeitos encontrados.")
         st.session_state.deteccoes = found
         st.session_state.img_gallery = gallery
+        st.rerun() # Atualiza a tela automaticamente para mostrar o resumo nos botões
 
 # =====================================================================
 # 5. DISPLAY DE RESULTADOS E PAGINAÇÃO
@@ -241,18 +252,39 @@ if st.session_state.deteccoes:
     st.divider()
     df_rep = pd.DataFrame(st.session_state.deteccoes)
     
+    # === ADEQUAÇÃO 1: Sistema de Filtros para a Tabela ===
+    st.subheader("📋 Filtros e Tabela Analítica")
+    st.markdown("*Use as caixas abaixo para filtrar os resultados desejados.*")
+    
+    col_filtro1, col_filtro2 = st.columns(2)
+    with col_filtro1:
+        # Filtro de Classe
+        classes_disponiveis = df_rep['Classe'].unique()
+        filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disponiveis, default=classes_disponiveis)
+    with col_filtro2:
+        # Filtro de Lado
+        lados_disponiveis = df_rep['Lado'].unique()
+        filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disponiveis, default=lados_disponiveis)
+        
+    # Aplica os filtros escolhidos ao DataFrame
+    df_filtrado = df_rep[(df_rep['Classe'].isin(filtro_classe)) & (df_rep['Lado'].isin(filtro_lado))]
+    
+    # Gera o Excel APENAS com os dados filtrados
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_rep.to_excel(writer, index=False, sheet_name='Defeitos_US')
+        df_filtrado.to_excel(writer, index=False, sheet_name='Defeitos_US')
     excel_data = output.getvalue()
     
-    # Botão agora obedecerá o CSS
     st.download_button(
-        label="📥 Baixar Relatório (Excel)", 
+        label="📥 Baixar Relatório Filtrado (Excel)", 
         data=excel_data, 
         file_name=f"relatorio_us_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+    
+    # Mostra a Tabela Filtrada na tela
+    st.dataframe(df_filtrado, hide_index=True, use_container_width=True)
+    st.divider()
     
     # --- SISTEMA DE PAGINAÇÃO DA GALERIA ---
     st.subheader("🖼️ Detecções (Galeria de Imagens)")
@@ -262,12 +294,10 @@ if st.session_state.deteccoes:
     total_imagens = len(st.session_state.img_gallery)
     total_paginas = max(1, (total_imagens - 1) // itens_por_pagina + 1)
     
-    # Define o "fatiamento" da lista de imagens
     inicio_idx = st.session_state.page * itens_por_pagina
     fim_idx = inicio_idx + itens_por_pagina
     imagens_atuais = st.session_state.img_gallery[inicio_idx:fim_idx]
     
-    # Exibe as imagens da página atual
     cols = st.columns(5)
     for idx, item in enumerate(imagens_atuais):
         with cols[idx % 5]:
@@ -276,9 +306,8 @@ if st.session_state.deteccoes:
                 st.image(item['img'], channels="BGR", use_container_width=True)
                 st.caption(item['label'])
     
-    # Renderiza os botões de controle de página abaixo da galeria
     if total_paginas > 1:
-        st.write("") # Espaçamento
+        st.write("") 
         col_esq, col_centro, col_dir = st.columns([1, 2, 1])
         
         with col_esq:
@@ -295,7 +324,3 @@ if st.session_state.deteccoes:
                 if st.button("Próxima Página ➡️", use_container_width=True):
                     st.session_state.page += 1
                     st.rerun()
-            
-    st.divider()
-    st.subheader("📋 Tabela Analítica")
-    st.dataframe(df_rep, use_container_width=True)
