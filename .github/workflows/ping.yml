@@ -1,0 +1,15 @@
+name: Manter Streamlit Acordado
+
+on:
+  schedule:
+    # Executa a cada 6 horas automaticamente
+    - cron: '0 */6 * * *'
+  workflow_dispatch: 
+    # Permite que você ative o robô manualmente com um clique para testar
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping no servidor do Streamlit
+        run: curl -sL https://gemini.google.com/app/ba135a3927a37341 > /dev/null
