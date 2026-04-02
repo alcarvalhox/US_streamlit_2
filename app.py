@@ -82,11 +82,11 @@ MODEL_DIR = "modelo"
 MODEL_PT = os.path.join(MODEL_DIR, "best_alma_1.pt")
 MODEL_OV = os.path.join(MODEL_DIR, "best_alma_1_openvino_model")
 
-# Inicialização de variáveis na memória
 if 'deteccoes' not in st.session_state: st.session_state.deteccoes = []
 if 'img_gallery' not in st.session_state: st.session_state.img_gallery = []
 if 'page' not in st.session_state: st.session_state.page = 0
-if 'audit_idx' not in st.session_state: st.session_state.audit_idx = 0 # Novo controle para a auditoria
+if 'audit_idx' not in st.session_state: st.session_state.audit_idx = 0 
+if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0 # Chave para resetar o upload de arquivos
 
 # =====================================================================
 # 2. ROTINAS DE PARIDADE TOTAL E OTIMIZAÇÃO (CACHE E OPENCV)
@@ -138,21 +138,59 @@ def generate_bscan_buffer(df_win, start, end):
     return img
 
 # =====================================================================
-# 3. INTERFACE E CONTROLES
+# 3. INTERFACE, CONTROLES E VALIDAÇÃO DE ARQUIVOS
 # =====================================================================
 col_upload, col_botoes = st.columns([3, 1])
 
 with col_upload:
-    files = st.file_uploader("Faça o Upload dos arquivos CSV", accept_multiple_files=True)
+    files = st.file_uploader(
+        "Faça o Upload dos arquivos CSV", 
+        type=['csv'], # Regra 1: Só permite selecionar extensão CSV
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state.uploader_key}" # Chave dinâmica para botão limpar
+    )
+    
+    # --- Regra 2: Validação rigorosa das colunas ---
+    arquivos_prontos = False
+    if files:
+        colunas_esperadas = {'odo', 'frame', 'probe', 'depth', 'sample', 'level'}
+        arquivos_validos = True
+        
+        for f in files:
+            try:
+                # Lê apenas a primeira linha para validar os nomes das colunas rapidamente
+                df_header = pd.read_csv(f, nrows=0)
+                colunas_atuais = set(df_header.columns)
+                
+                if not colunas_esperadas.issubset(colunas_atuais):
+                    st.error(f"⚠️ **Erro no arquivo:** `{f.name}`\n\nO formato está fora do padrão aceito. O arquivo deve conter obrigatoriamente as colunas: `odo`, `frame`, `probe`, `depth`, `sample`, `level`.")
+                    arquivos_validos = False
+                    break # Para a validação no primeiro erro encontrado
+            except Exception as e:
+                st.error(f"⚠️ **Erro de Leitura:** Não foi possível ler o arquivo `{f.name}`. Verifique se ele não está corrompido.")
+                arquivos_validos = False
+                break
+                
+        if arquivos_validos:
+            st.success(f"✅ {len(files)} arquivo(s) validado(s) e dentro do padrão!")
+            arquivos_prontos = True
 
 with col_botoes:
     st.markdown("<br>", unsafe_allow_html=True)
-    btn_run = st.button("🚀 Iniciar Inferência", type="primary", use_container_width=True)
+    # O botão de iniciar só é ativado se a validação passar (arquivos_prontos == True)
+    btn_run = st.button("🚀 Iniciar Inferência", type="primary", use_container_width=True, disabled=not arquivos_prontos)
+    
+    # Novo botão para limpar apenas os arquivos sem resetar os resultados da tela
+    if st.button("🧹 Limpar Arquivos", use_container_width=True):
+        st.session_state.uploader_key += 1 # Altera a chave, forçando o Streamlit a esvaziar a caixa de upload
+        st.rerun()
+
     if st.button("🗑️ Resetar Sistema", use_container_width=True):
         st.session_state.deteccoes = []
         st.session_state.img_gallery = []
         st.session_state.page = 0 
-        st.session_state.audit_idx = 0 # Reseta o ponteiro de auditoria
+        st.session_state.audit_idx = 0 
+        st.session_state.uploader_key += 1 # Limpa os arquivos também
         st.cache_resource.clear()
         st.cache_data.clear() 
         st.rerun()
@@ -160,9 +198,9 @@ with col_botoes:
 # =====================================================================
 # 4. PROCESSAMENTO E INFERÊNCIA COM DESENHO CUSTOMIZADO
 # =====================================================================
-if btn_run and files:
+if btn_run and arquivos_prontos:
     st.session_state.page = 0 
-    st.session_state.audit_idx = 0 # Reseta o ponteiro sempre que rodar nova inferência
+    st.session_state.audit_idx = 0 
     model = load_ov_model()
     if model:
         progress_bar = st.progress(0.0, text="Lendo e preparando arquivos CSV da memória cache...")
@@ -203,7 +241,6 @@ if btn_run and files:
                             x1, y1, x2, y2 = bx.astype(int)
                             classe_nome = model.names[int(box.cls)]
                             
-                            # --- DESENHO PERSONALIZADO NA IMAGEM ---
                             cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0, 0, 255), 2)
                             texto = f"#{local_id} {classe_nome}"
                             (w_txt, h_txt), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
@@ -250,14 +287,12 @@ if st.session_state.deteccoes:
     
     df_raw = pd.DataFrame(st.session_state.deteccoes)
     
-    # --- TRAVA DE SEGURANÇA PARA MEMÓRIA ANTIGA ---
     if 'Aprovado' not in df_raw.columns:
         df_raw['Aprovado'] = True
     if 'ID_Global' not in df_raw.columns:
         df_raw['ID_Global'] = df_raw.index
     if 'ID_Img' not in df_raw.columns:
         df_raw['ID_Img'] = "#-"
-    # ---------------------------------------------------------------
     
     df_aprovados = df_raw[df_raw['Aprovado'] == True].drop(columns=['ID_Global', 'Aprovado', 'ID_Img'])
     
@@ -318,7 +353,6 @@ if st.session_state.deteccoes:
         total_imagens_det = len(st.session_state.img_gallery)
         if total_imagens_det > 0:
             
-            # --- Sistema de Navegação (Substitui o number_input) ---
             col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
             with col_nav_esq:
                 if st.session_state.audit_idx > 0:
@@ -333,14 +367,13 @@ if st.session_state.deteccoes:
                         st.session_state.audit_idx += 1
                         st.rerun()
             
-            # Trava de segurança: se o índice estourar o limite (ex: após resetar)
             if st.session_state.audit_idx >= total_imagens_det:
                 st.session_state.audit_idx = 0
                 
             img_idx = st.session_state.audit_idx
             img_atual = st.session_state.img_gallery[img_idx]
             
-            st.markdown("<br>", unsafe_allow_html=True) # Espaçamento
+            st.markdown("<br>", unsafe_allow_html=True) 
             
             col_esq, col_dir = st.columns([3, 2])
             
