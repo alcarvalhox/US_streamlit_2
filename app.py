@@ -1,7 +1,7 @@
 import subprocess
 import sys
 import os
-import base64 # Novo import necessário para processar as imagens no cabeçalho
+import base64
 
 # =====================================================================
 # 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
@@ -40,39 +40,34 @@ st.set_page_config(
 
 cores_mrs = """
 <style>
-/* Reduzindo o padding do topo para aproveitar melhor a tela */
 .block-container {
     padding-top: 2rem;
     padding-bottom: 2rem;
 }
-/* Cor de fundo principal Azul Escuro */
 .stApp {
     background-color: #003865;
 }
-/* Textos em branco para contraste */
 h1, h2, h3, p, label, .stMarkdown, .stText {
     color: white !important;
 }
-/* Abas (Tabs) customizadas */
 .stTabs [data-baseweb="tab-list"] {
     gap: 20px;
 }
 .stTabs [data-baseweb="tab"] {
     background-color: transparent !important;
-    color: #FFC600 !important; /* Amarelo MRS para abas inativas */
+    color: #FFC600 !important;
 }
 .stTabs [aria-selected="true"] {
-    color: white !important; /* Branco para aba ativa */
+    color: white !important;
     border-bottom-color: #FFC600 !important;
 }
-/* Estilo dos Botões Normais e Botão de Download */
 .stButton>button, [data-testid="stDownloadButton"] button {
     background-color: #FFC600;
     color: #003865 !important;
     font-weight: bold;
     border: none;
     border-radius: 5px;
-    margin-top: 5px; /* Alinhamento suave */
+    margin-top: 5px;
 }
 .stButton>button:hover, [data-testid="stDownloadButton"] button:hover {
     background-color: #e6b300; 
@@ -90,21 +85,19 @@ h1, h2, h3, p, label, .stMarkdown, .stText {
 """
 st.markdown(cores_mrs, unsafe_allow_html=True)
 
-# Função auxiliar para garantir alinhamento perfeito e bordas estilizadas
 def load_image_b64(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
-# Colunas simétricas (1, 4, 1) para: Logo, Título Centralizado e Veículo
 col_logo, col_titulo, col_veiculo = st.columns([1, 4, 1])
 
 with col_logo:
     try:
         img_logo = load_image_b64("logo.png")
-        # Centraliza a logo na coluna
+        # Tamanho fixo (ex: 160x110) para garantir simetria
         st.markdown(
             f'<div style="display: flex; justify-content: center; align-items: center; height: 100%;">'
-            f'<img src="data:image/png;base64,{img_logo}" style="width: 150px; max-width: 100%;">'
+            f'<img src="data:image/png;base64,{img_logo}" style="width: 160px; height: 110px; object-fit: contain;">'
             f'</div>', 
             unsafe_allow_html=True
         )
@@ -112,16 +105,15 @@ with col_logo:
         st.warning("⚠️ Logo não encontrada.")
         
 with col_titulo:
-    # Usando HTML para garantir o text-align: center
     st.markdown("<h1 style='text-align: center; margin-top: -10px;'>Detecção Automática de Defeitos de Inspeções de US</h1>", unsafe_allow_html=True)
     
 with col_veiculo:
     try:
         img_veiculo = load_image_b64("veiculo_us.jpg")
-        # Centraliza o veículo e aplica bordas arredondadas e sombra suave
+        # Mesmo tamanho fixo (160x110) com object-fit: cover para não distorcer o veículo
         st.markdown(
             f'<div style="display: flex; justify-content: center; align-items: center; height: 100%;">'
-            f'<img src="data:image/jpeg;base64,{img_veiculo}" style="width: 150px; max-width: 100%; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">'
+            f'<img src="data:image/jpeg;base64,{img_veiculo}" style="width: 160px; height: 110px; object-fit: cover; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">'
             f'</div>', 
             unsafe_allow_html=True
         )
