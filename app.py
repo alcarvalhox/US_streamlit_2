@@ -75,10 +75,6 @@ h1, h2, h3, p, label, .stMarkdown, .stText {
     background-color: white;
     border-radius: 5px;
 }
-.streamlit-expanderHeader {
-    color: #FFC600 !important;
-    font-weight: bold;
-}
 </style>
 """
 st.markdown(cores_mrs, unsafe_allow_html=True)
@@ -135,7 +131,6 @@ if 'page' not in st.session_state:
 # =====================================================================
 @st.cache_data
 def ler_e_preparar_dados(arquivos):
-    # Reseta o ponteiro dos arquivos para permitir releituras se necessário
     for f in arquivos: f.seek(0)
     
     df_raw = pd.concat([pd.read_csv(f) for f in arquivos]).sort_values(by='odo')
@@ -213,7 +208,7 @@ with col_botoes:
         st.session_state.img_gallery = []
         st.session_state.page = 0 
         st.cache_resource.clear()
-        st.cache_data.clear() # Limpa o cache dos CSVs também
+        st.cache_data.clear() 
         st.rerun()
 
 # =====================================================================
@@ -225,7 +220,6 @@ if btn_run and files:
     if model:
         progress_bar = st.progress(0.0, text="Lendo e preparando arquivos CSV da memória cache...")
         
-        # Leitura ultra-rápida isolada
         df_esq_raw, df_dir_raw = ler_e_preparar_dados(files)
         
         progress_bar.progress(0.05, text="Removendo ruídos e pontos isolados...")
@@ -342,7 +336,8 @@ if st.session_state.deteccoes:
         st.dataframe(df_filtrado, hide_index=True, use_container_width=True)
         
     with aba_galeria:
-        st.markdown("##### Dica: Clique na aba inferior da miniatura para ampliá-la.")
+        # Dica atualizada para o comportamento nativo do Streamlit
+        st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão no canto superior direito para visualizá-la em tela cheia.")
         
         itens_por_pagina = 20
         total_imagens = len(st.session_state.img_gallery)
@@ -355,10 +350,12 @@ if st.session_state.deteccoes:
         cols = st.columns(5)
         for idx, item in enumerate(imagens_atuais):
             with cols[idx % 5]:
+                # Renderiza apenas a imagem de forma nativa e a legenda embaixo
                 st.image(item['img'], channels="BGR", use_container_width=True)
-                with st.expander(f"🔎 Ampliar ODO: {item['label'].split('@')[1]}"):
-                    st.image(item['img'], channels="BGR", use_container_width=True)
-                    st.caption(item['label'])
+                
+                # Extrai apenas o número do ODO para a legenda
+                odo_val = item['label'].split('@')[1].strip()
+                st.markdown(f"<div style='text-align: center; color: #FFC600; font-weight: bold; margin-top: -10px; margin-bottom: 15px;'>ODO: {odo_val}</div>", unsafe_allow_html=True)
         
         if total_paginas > 1:
             st.write("") 
