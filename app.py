@@ -39,6 +39,11 @@ st.set_page_config(
 
 cores_mrs = """
 <style>
+/* Reduzindo o padding do topo para aproveitar melhor a tela */
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 2rem;
+}
 /* Cor de fundo principal Azul Escuro */
 .stApp {
     background-color: #003865;
@@ -47,6 +52,18 @@ cores_mrs = """
 h1, h2, h3, p, label, .stMarkdown, .stText {
     color: white !important;
 }
+/* Abas (Tabs) customizadas */
+.stTabs [data-baseweb="tab-list"] {
+    gap: 20px;
+}
+.stTabs [data-baseweb="tab"] {
+    background-color: transparent !important;
+    color: #FFC600 !important; /* Amarelo MRS para abas inativas */
+}
+.stTabs [aria-selected="true"] {
+    color: white !important; /* Branco para aba ativa */
+    border-bottom-color: #FFC600 !important;
+}
 /* Estilo dos Botões Normais e Botão de Download */
 .stButton>button, [data-testid="stDownloadButton"] button {
     background-color: #FFC600;
@@ -54,6 +71,7 @@ h1, h2, h3, p, label, .stMarkdown, .stText {
     font-weight: bold;
     border: none;
     border-radius: 5px;
+    margin-top: 5px; /* Alinhamento suave */
 }
 .stButton>button:hover, [data-testid="stDownloadButton"] button:hover {
     background-color: #e6b300; 
@@ -71,21 +89,32 @@ h1, h2, h3, p, label, .stMarkdown, .stText {
 """
 st.markdown(cores_mrs, unsafe_allow_html=True)
 
-col_logo, col_titulo = st.columns([1, 4])
+# Colunas simétricas (1, 4, 1) para: Logo, Título Centralizado e Veículo
+col_logo, col_titulo, col_veiculo = st.columns([1, 4, 1])
 with col_logo:
     try:
         st.image("logo.png", width=150)
     except:
-        st.warning("⚠️ Arquivo 'logo.png' não encontrado na pasta principal.")
+        st.warning("⚠️ Logo não encontrada.")
+        
 with col_titulo:
-    st.title("Detecção automática de defeitos de inspeções de US")
+    # Usando HTML para garantir o text-align: center
+    st.markdown("<h1 style='text-align: center; margin-top: -10px;'>Detecção Automática de Defeitos de Inspeções de US</h1>", unsafe_allow_html=True)
+    
+with col_veiculo:
+    try:
+        # Colocando a imagem do veículo à direita do título
+        st.image("veiculo_us.jpg", width=150)
+    except:
+        st.warning("⚠️ Imagem do veículo não encontrada.")
+
+st.markdown("<hr style='margin-top: -5px; margin-bottom: 15px;'>", unsafe_allow_html=True)
 
 MODEL_DIR = "modelo"
 MODEL_PT = os.path.join(MODEL_DIR, "best_alma_1.pt")
 MODEL_OV = os.path.join(MODEL_DIR, "best_alma_1_openvino_model")
 LIMITES_DEPTH = {'alma': (53, 179)}
 
-# Inicialização de Variáveis na Memória (Session State)
 if 'deteccoes' not in st.session_state:
     st.session_state.deteccoes = []
 if 'img_gallery' not in st.session_state:
@@ -134,19 +163,15 @@ def generate_bscan_buffer(df_win, start, end):
     return img
 
 # =====================================================================
-# 3. INTERFACE E CONTROLES
+# 3. INTERFACE E CONTROLES (LAYOUT COMPACTO)
 # =====================================================================
-st.markdown("### Seleção de Dados")
-
-# Estrutura ajustada: 2 colunas. Upload na esquerda, Botões empilhados na direita.
 col_upload, col_botoes = st.columns([3, 1])
 
 with col_upload:
     files = st.file_uploader("Faça o Upload dos arquivos CSV", accept_multiple_files=True)
 
 with col_botoes:
-    st.write("") 
-    # Iniciar em cima, Resetar embaixo
+    st.markdown("<br>", unsafe_allow_html=True)
     btn_run = st.button("🚀 Iniciar Inferência", type="primary", use_container_width=True)
     if st.button("🗑️ Resetar Sistema", use_container_width=True):
         st.session_state.deteccoes = []
@@ -154,17 +179,6 @@ with col_botoes:
         st.session_state.page = 0 
         st.cache_resource.clear()
         st.rerun()
-        
-    # === ADEQUAÇÃO 2: Tabela de Resumo abaixo do botão Resetar ===
-    if st.session_state.deteccoes:
-        st.markdown("<br>", unsafe_allow_html=True) # Espaçamento
-        st.markdown("##### 📊 Resumo de Detecções")
-        df_resumo_temp = pd.DataFrame(st.session_state.deteccoes)
-        # Conta a quantidade de cada classe
-        contagem_classes = df_resumo_temp['Classe'].value_counts().reset_index()
-        contagem_classes.columns = ['Classe de Defeito', 'Quantidade']
-        # Exibe a tabela sem o índice numérico lateral
-        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
 
 # =====================================================================
 # 4. PROCESSAMENTO E INFERÊNCIA
@@ -243,84 +257,87 @@ if btn_run and files:
         progress_bar.progress(1.0, text=f"✅ Inferência concluída! {len(found)} defeitos encontrados.")
         st.session_state.deteccoes = found
         st.session_state.img_gallery = gallery
-        st.rerun() # Atualiza a tela automaticamente para mostrar o resumo nos botões
+        st.rerun() 
 
 # =====================================================================
-# 5. DISPLAY DE RESULTADOS E PAGINAÇÃO
+# 5. DISPLAY DE RESULTADOS (ORGANIZADO EM ABAS)
 # =====================================================================
 if st.session_state.deteccoes:
-    st.divider()
+    st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
     df_rep = pd.DataFrame(st.session_state.deteccoes)
     
-    # === ADEQUAÇÃO 1: Sistema de Filtros para a Tabela ===
-    st.subheader("📋 Filtros e Tabela Analítica")
-    st.markdown("*Use as caixas abaixo para filtrar os resultados desejados.*")
+    aba_dados, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "🖼️ Galeria de Imagens"])
     
-    col_filtro1, col_filtro2 = st.columns(2)
-    with col_filtro1:
-        # Filtro de Classe
-        classes_disponiveis = df_rep['Classe'].unique()
-        filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disponiveis, default=classes_disponiveis)
-    with col_filtro2:
-        # Filtro de Lado
-        lados_disponiveis = df_rep['Lado'].unique()
-        filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disponiveis, default=lados_disponiveis)
+    with aba_dados:
+        col_resumo, col_filtros = st.columns([1, 2])
         
-    # Aplica os filtros escolhidos ao DataFrame
-    df_filtrado = df_rep[(df_rep['Classe'].isin(filtro_classe)) & (df_rep['Lado'].isin(filtro_lado))]
-    
-    # Gera o Excel APENAS com os dados filtrados
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df_filtrado.to_excel(writer, index=False, sheet_name='Defeitos_US')
-    excel_data = output.getvalue()
-    
-    st.download_button(
-        label="📥 Baixar Relatório Filtrado (Excel)", 
-        data=excel_data, 
-        file_name=f"relatorio_us_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    
-    # Mostra a Tabela Filtrada na tela
-    st.dataframe(df_filtrado, hide_index=True, use_container_width=True)
-    st.divider()
-    
-    # --- SISTEMA DE PAGINAÇÃO DA GALERIA ---
-    st.subheader("🖼️ Detecções (Galeria de Imagens)")
-    st.markdown("*Dica: Clique na aba abaixo de cada Thumbnail para ver a imagem em tamanho real.*")
-    
-    itens_por_pagina = 20
-    total_imagens = len(st.session_state.img_gallery)
-    total_paginas = max(1, (total_imagens - 1) // itens_por_pagina + 1)
-    
-    inicio_idx = st.session_state.page * itens_por_pagina
-    fim_idx = inicio_idx + itens_por_pagina
-    imagens_atuais = st.session_state.img_gallery[inicio_idx:fim_idx]
-    
-    cols = st.columns(5)
-    for idx, item in enumerate(imagens_atuais):
-        with cols[idx % 5]:
-            st.image(item['img'], channels="BGR", use_container_width=True)
-            with st.expander(f"🔎 Ampliar ODO: {item['label'].split('@')[1]}"):
-                st.image(item['img'], channels="BGR", use_container_width=True)
-                st.caption(item['label'])
-    
-    if total_paginas > 1:
-        st.write("") 
-        col_esq, col_centro, col_dir = st.columns([1, 2, 1])
-        
-        with col_esq:
-            if st.session_state.page > 0:
-                if st.button("⬅️ Página Anterior", use_container_width=True):
-                    st.session_state.page -= 1
-                    st.rerun()
-                    
-        with col_centro:
-            st.markdown(f"<h5 style='text-align: center; color: white;'>Mostrando imagens {inicio_idx + 1} a {min(fim_idx, total_imagens)} (Página {st.session_state.page + 1} de {total_paginas})</h5>", unsafe_allow_html=True)
+        with col_resumo:
+            st.markdown("##### 📈 Resumo Geral")
+            contagem_classes = df_rep['Classe'].value_counts().reset_index()
+            contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
+            st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
             
-        with col_dir:
-            if st.session_state.page < total_paginas - 1:
-                if st.button("Próxima Página ➡️", use_container_width=True):
-                    st.session_state.page += 1
-                    st.rerun()
+        with col_filtros:
+            st.markdown("##### 🔍 Refinar Busca")
+            cf1, cf2 = st.columns(2)
+            with cf1:
+                classes_disponiveis = df_rep['Classe'].unique()
+                filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disponiveis, default=classes_disponiveis)
+            with cf2:
+                lados_disponiveis = df_rep['Lado'].unique()
+                filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disponiveis, default=lados_disponiveis)
+                
+        df_filtrado = df_rep[(df_rep['Classe'].isin(filtro_classe)) & (df_rep['Lado'].isin(filtro_lado))]
+        
+        st.markdown("<br>", unsafe_allow_html=True)
+        col_down, col_vazia2 = st.columns([1, 3])
+        with col_down:
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_filtrado.to_excel(writer, index=False, sheet_name='Defeitos_US')
+            excel_data = output.getvalue()
+            
+            st.download_button(
+                label="📥 Baixar Dados Filtrados", 
+                data=excel_data, 
+                file_name=f"relatorio_us_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+            
+        st.dataframe(df_filtrado, hide_index=True, use_container_width=True)
+        
+    with aba_galeria:
+        st.markdown("##### Dica: Clique na aba inferior da miniatura para ampliá-la.")
+        
+        itens_por_pagina = 20
+        total_imagens = len(st.session_state.img_gallery)
+        total_paginas = max(1, (total_imagens - 1) // itens_por_pagina + 1)
+        
+        inicio_idx = st.session_state.page * itens_por_pagina
+        fim_idx = inicio_idx + itens_por_pagina
+        imagens_atuais = st.session_state.img_gallery[inicio_idx:fim_idx]
+        
+        cols = st.columns(5)
+        for idx, item in enumerate(imagens_atuais):
+            with cols[idx % 5]:
+                st.image(item['img'], channels="BGR", use_container_width=True)
+                with st.expander(f"🔎 Ampliar ODO: {item['label'].split('@')[1]}"):
+                    st.image(item['img'], channels="BGR", use_container_width=True)
+                    st.caption(item['label'])
+        
+        if total_paginas > 1:
+            st.write("") 
+            col_esq, col_centro, col_dir = st.columns([1, 2, 1])
+            with col_esq:
+                if st.session_state.page > 0:
+                    if st.button("⬅️ Anterior", use_container_width=True):
+                        st.session_state.page -= 1
+                        st.rerun()
+            with col_centro:
+                st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Mostrando imagens {inicio_idx + 1} a {min(fim_idx, total_imagens)} (Página {st.session_state.page + 1} de {total_paginas})</h5>", unsafe_allow_html=True)
+            with col_dir:
+                if st.session_state.page < total_paginas - 1:
+                    if st.button("Próxima ➡️", use_container_width=True):
+                        st.session_state.page += 1
+                        st.rerun()
