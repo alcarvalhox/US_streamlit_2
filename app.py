@@ -226,10 +226,10 @@ if btn_run and arquivos_prontos:
                 if len(df_win) > 5:
                     img = generate_bscan_buffer(df_win, start, end)
                     
-                    # --- NMS AJUSTADO PARA EVITAR DUPLICIDADE ---
-                    # iou=0.4: Suprime caixas com mais de 40% de sobreposição
-                    # agnostic_nms=True: Suprime caixas sobrepostas independente da classe
-                    results = model.predict(img, verbose=False, conf=0.3, iou=0.4, agnostic_nms=True)
+                    # --- NMS ULTRA-AGRESSIVO ---
+                    # iou=0.1: Se as caixas se sobrepuserem em 10%, a de menor confiança é apagada.
+                    # agnostic_nms=True: Apaga caixas duplicadas mesmo se forem de classes diferentes.
+                    results = model.predict(img, verbose=False, conf=0.3, iou=0.1, agnostic_nms=True)
                     
                     if len(results[0].boxes) > 0:
                         img_draw = img.copy()
@@ -389,7 +389,6 @@ if st.session_state.deteccoes:
                     mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado'])
                     df_imagem_atual = df_raw[mask].copy()
                     
-                    # --- TABELA DE AUDITORIA ATUALIZADA (INCLUINDO CONFIANÇA) ---
                     edited_df = st.data_editor(
                         df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
                         column_config={
@@ -397,7 +396,7 @@ if st.session_state.deteccoes:
                             "ID_Global": None, 
                             "ID_Img": st.column_config.TextColumn("Ref na Imagem")
                         },
-                        disabled=['ID_Img', 'Classe', 'Confiança', 'Comprimento(mm)'], # Trava edição das colunas informativas
+                        disabled=['ID_Img', 'Classe', 'Confiança', 'Comprimento(mm)'], 
                         hide_index=True,
                         use_container_width=True,
                         key=f"editor_img_{img_idx}" 
