@@ -25,8 +25,6 @@ import cv2
 import io
 from ultralytics import YOLO
 from datetime import datetime
-import matplotlib.pyplot as plt
-import seaborn as sns
 from scipy.spatial import cKDTree
 
 # =====================================================================
@@ -94,7 +92,6 @@ col_logo, col_titulo, col_veiculo = st.columns([1, 4, 1])
 with col_logo:
     try:
         img_logo = load_image_b64("logo.png")
-        # Inserido margin-top, border-radius e box-shadow para ficar igual ao veículo
         st.markdown(
             f'<div style="display: flex; justify-content: center; align-items: center; height: 100%; margin-top: 20px;">'
             f'<img src="data:image/png;base64,{img_logo}" style="width: 160px; height: 110px; object-fit: contain; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">'
@@ -134,8 +131,21 @@ if 'page' not in st.session_state:
     st.session_state.page = 0
 
 # =====================================================================
-# 2. ROTINAS DE PARIDADE TOTAL (FILTRAGEM E CONVERSÃO)
+# 2. ROTINAS DE PARIDADE TOTAL E OTIMIZAÇÃO (CACHE E OPENCV)
 # =====================================================================
+@st.cache_data
+def ler_e_preparar_dados(arquivos):
+    # Reseta o ponteiro dos arquivos para permitir releituras se necessário
+    for f in arquivos: f.seek(0)
+    
+    df_raw = pd.concat([pd.read_csv(f) for f in arquivos]).sort_values(by='odo')
+    df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
+    
+    df_esq = df_raw[df_raw['probe'].isin([0, 6, 8, 4, 10]) & (df_raw['level'] > 450)]
+    df_dir = df_raw[df_raw['probe'].isin([1, 7, 9, 5, 11]) & (df_raw['level'] > 450)]
+    
+    return df_esq, df_dir
+
 def remover_pontos_isolados(df, raio=10):
     if df.empty: return df
     coords = df[['odo', 'depth']].values
@@ -158,19 +168,33 @@ def load_ov_model():
     return YOLO(MODEL_OV, task='detect')
 
 def generate_bscan_buffer(df_win, start, end):
-    probe_colors = {0: 'yellow', 1: 'yellow', 6: 'green', 8: 'purple', 
-                    4: 'red', 10: 'blue', 7: 'green', 9: 'purple', 5: 'red', 11: 'blue'}
-    fig, ax = plt.subplots(figsize=(15, 5), dpi=100)
-    sns.scatterplot(data=df_win, x="odo", y="depth", hue="probe", 
-                    palette=probe_colors, ax=ax, marker='^', s=60, legend=False)
-    ax.set_xlim(start, end)
-    ax.set_ylim(179, 53)
-    ax.axis('off')
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches='tight', pad_inches=0)
-    buf.seek(0)
-    img = cv2.imdecode(np.frombuffer(buf.getvalue(), dtype=np.uint8), 1)
-    plt.close(fig)
+    width, height = 1500, 500
+    img = np.full((height, width, 3), 255, dtype=np.uint8)
+
+    probe_to_bgr = {
+        0: (0, 255, 255), 1: (0, 255, 255),   
+        6: (0, 128, 0),   7: (0, 128, 0),     
+        8: (128, 0, 128), 9: (128, 0, 128),   
+        4: (0, 0, 255),   5: (0, 0, 255),     
+        10: (255, 0, 0),  11: (255, 0, 0)     
+    }
+
+    odos = df_win['odo'].values
+    depths = df_win['depth'].values
+    probes = df_win['probe'].values
+
+    x_coords = ((odos - start) / 2400.0 * width).astype(int)
+    y_coords = ((depths - 53) / 126.0 * height).astype(int)
+
+    size = 6
+    base_triangle = np.array([[0, -size], [-size, size], [size, size]], dtype=np.int32)
+
+    for x, y, p in zip(x_coords, y_coords, probes):
+        if 0 <= x < width and 0 <= y < height:
+            bgr_color = probe_to_bgr.get(p, (0, 255, 255))
+            triangle = base_triangle + [x, y]
+            cv2.fillPoly(img, [triangle], bgr_color)
+
     return img
 
 # =====================================================================
@@ -189,6 +213,7 @@ with col_botoes:
         st.session_state.img_gallery = []
         st.session_state.page = 0 
         st.cache_resource.clear()
+        st.cache_data.clear() # Limpa o cache dos CSVs também
         st.rerun()
 
 # =====================================================================
@@ -198,16 +223,14 @@ if btn_run and files:
     st.session_state.page = 0 
     model = load_ov_model()
     if model:
-        progress_bar = st.progress(0.0, text="Iniciando a leitura dos arquivos CSV...")
+        progress_bar = st.progress(0.0, text="Lendo e preparando arquivos CSV da memória cache...")
         
-        df_raw = pd.concat([pd.read_csv(f) for f in files]).sort_values(by='odo')
-        df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
+        # Leitura ultra-rápida isolada
+        df_esq_raw, df_dir_raw = ler_e_preparar_dados(files)
         
-        df_esq = df_raw[df_raw['probe'].isin([0, 6, 8, 4, 10]) & (df_raw['level'] > 450)]
-        df_dir = df_raw[df_raw['probe'].isin([1, 7, 9, 5, 11]) & (df_raw['level'] > 450)]
-        
-        df_esq = remover_pontos_isolados(df_esq)
-        df_dir = remover_pontos_isolados(df_dir)
+        progress_bar.progress(0.05, text="Removendo ruídos e pontos isolados...")
+        df_esq = remover_pontos_isolados(df_esq_raw)
+        df_dir = remover_pontos_isolados(df_dir_raw)
         
         found = []
         gallery = []
@@ -226,7 +249,7 @@ if btn_run and files:
             steps = range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400)
             for start in steps:
                 passo_atual += 1
-                perc = min(passo_atual / total_steps, 1.0)
+                perc = min(0.05 + (0.95 * passo_atual / max(1, total_steps)), 1.0)
                 progress_bar.progress(perc, text=f"Analisando {lado_nome}: ODO {start}mm (Passo {passo_atual}/{total_steps})...")
 
                 end = start + 2400
