@@ -82,9 +82,11 @@ MODEL_DIR = "modelo"
 MODEL_PT = os.path.join(MODEL_DIR, "best_alma_1.pt")
 MODEL_OV = os.path.join(MODEL_DIR, "best_alma_1_openvino_model")
 
+# Inicialização de variáveis na memória
 if 'deteccoes' not in st.session_state: st.session_state.deteccoes = []
 if 'img_gallery' not in st.session_state: st.session_state.img_gallery = []
 if 'page' not in st.session_state: st.session_state.page = 0
+if 'audit_idx' not in st.session_state: st.session_state.audit_idx = 0 # Novo controle para a auditoria
 
 # =====================================================================
 # 2. ROTINAS DE PARIDADE TOTAL E OTIMIZAÇÃO (CACHE E OPENCV)
@@ -150,6 +152,7 @@ with col_botoes:
         st.session_state.deteccoes = []
         st.session_state.img_gallery = []
         st.session_state.page = 0 
+        st.session_state.audit_idx = 0 # Reseta o ponteiro de auditoria
         st.cache_resource.clear()
         st.cache_data.clear() 
         st.rerun()
@@ -159,6 +162,7 @@ with col_botoes:
 # =====================================================================
 if btn_run and files:
     st.session_state.page = 0 
+    st.session_state.audit_idx = 0 # Reseta o ponteiro sempre que rodar nova inferência
     model = load_ov_model()
     if model:
         progress_bar = st.progress(0.0, text="Lendo e preparando arquivos CSV da memória cache...")
@@ -200,18 +204,12 @@ if btn_run and files:
                             classe_nome = model.names[int(box.cls)]
                             
                             # --- DESENHO PERSONALIZADO NA IMAGEM ---
-                            # Desenha o retângulo da detecção (Vermelho)
                             cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                            
-                            # Fundo para o texto (Vermelho) para dar contraste
                             texto = f"#{local_id} {classe_nome}"
                             (w_txt, h_txt), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                             cv2.rectangle(img_draw, (x1, y1 - 25), (x1 + w_txt + 5, y1), (0, 0, 255), -1)
-                            
-                            # Escreve o ID + Classe em branco
                             cv2.putText(img_draw, texto, (x1 + 2, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                             
-                            # Cálculos físicos
                             px1, px2 = x1/w, x2/w
                             py1, py2 = y1/h, y2/h
                             center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
@@ -219,7 +217,7 @@ if btn_run and files:
                             comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(126 * py2) - int(126 * py1))**2))
                             
                             found.append({
-                                'ID_Global': len(found), # ID invisível para sincronizar as tabelas
+                                'ID_Global': len(found),
                                 'ID_Img': f"#{local_id}",
                                 'Lado': lado_nome,
                                 'Classe': classe_nome,
@@ -228,7 +226,7 @@ if btn_run and files:
                                 'Coordenada Depth(mm)': int(center_y_mm),
                                 'Comprimento(mm)': comprimento,
                                 'Confiança': f"{float(box.conf):.2%}",
-                                'Aprovado': True # Status Padrão Inicial
+                                'Aprovado': True
                             })
                             local_id += 1
                             
@@ -250,14 +248,23 @@ if btn_run and files:
 if st.session_state.deteccoes:
     st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
     
-    # Prepara o DataFrame ignorando as linhas que foram REPROVADAS na aba de auditoria
     df_raw = pd.DataFrame(st.session_state.deteccoes)
+    
+    # --- TRAVA DE SEGURANÇA PARA MEMÓRIA ANTIGA ---
+    if 'Aprovado' not in df_raw.columns:
+        df_raw['Aprovado'] = True
+    if 'ID_Global' not in df_raw.columns:
+        df_raw['ID_Global'] = df_raw.index
+    if 'ID_Img' not in df_raw.columns:
+        df_raw['ID_Img'] = "#-"
+    # ---------------------------------------------------------------
+    
     df_aprovados = df_raw[df_raw['Aprovado'] == True].drop(columns=['ID_Global', 'Aprovado', 'ID_Img'])
     
     aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria de Falsos Positivos", "🖼️ Galeria Geral"])
     
     # -----------------------------------------------------------------
-    # ABA 1: TABELAS (Mostra apenas os Aprovados)
+    # ABA 1: TABELAS
     # -----------------------------------------------------------------
     with aba_dados:
         col_resumo, col_filtros = st.columns([1, 2])
@@ -303,21 +310,41 @@ if st.session_state.deteccoes:
             st.dataframe(df_filtrado, hide_index=True, use_container_width=True)
             
     # -----------------------------------------------------------------
-    # ABA 2: AUDITORIA (Human-in-the-Loop)
+    # ABA 2: AUDITORIA (NAVEGAÇÃO POR SETAS)
     # -----------------------------------------------------------------
     with aba_auditoria:
         st.markdown("##### Selecione a imagem para avaliar os defeitos encontrados:")
         
         total_imagens_det = len(st.session_state.img_gallery)
         if total_imagens_det > 0:
-            # Controle numérico para navegar imagem por imagem
-            img_idx = st.number_input("Imagem Nº", min_value=1, max_value=total_imagens_det, value=1) - 1
+            
+            # --- Sistema de Navegação (Substitui o number_input) ---
+            col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
+            with col_nav_esq:
+                if st.session_state.audit_idx > 0:
+                    if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_audit_prev"):
+                        st.session_state.audit_idx -= 1
+                        st.rerun()
+            with col_nav_centro:
+                st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx + 1} de {total_imagens_det}</h5>", unsafe_allow_html=True)
+            with col_nav_dir:
+                if st.session_state.audit_idx < total_imagens_det - 1:
+                    if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_audit_next"):
+                        st.session_state.audit_idx += 1
+                        st.rerun()
+            
+            # Trava de segurança: se o índice estourar o limite (ex: após resetar)
+            if st.session_state.audit_idx >= total_imagens_det:
+                st.session_state.audit_idx = 0
+                
+            img_idx = st.session_state.audit_idx
             img_atual = st.session_state.img_gallery[img_idx]
+            
+            st.markdown("<br>", unsafe_allow_html=True) # Espaçamento
             
             col_esq, col_dir = st.columns([3, 2])
             
             with col_esq:
-                # Mostra a imagem com as caixas numeradas manualmente
                 st.image(img_atual['img'], channels="BGR", use_container_width=True)
                 st.caption(f"Visualizando: {img_atual['label']}")
                 
@@ -325,35 +352,35 @@ if st.session_state.deteccoes:
                 st.markdown("#### Validar Detecções")
                 st.markdown("Desmarque a caixa para excluir um Falso Positivo do Relatório Final.")
                 
-                # Filtra a tabela global para pegar SÓ os defeitos desta imagem
-                mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado'])
-                df_imagem_atual = df_raw[mask].copy()
-                
-                # Renderiza o Data Editor com Checkbox
-                edited_df = st.data_editor(
-                    df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Comprimento(mm)', 'Aprovado']],
-                    column_config={
-                        "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
-                        "ID_Global": None, # Esconde a coluna técnica do usuário
-                        "ID_Img": st.column_config.TextColumn("Ref na Imagem")
-                    },
-                    disabled=['ID_Img', 'Classe', 'Comprimento(mm)'], # Trava edição de dados reais
-                    hide_index=True,
-                    use_container_width=True,
-                    key=f"editor_img_{img_idx}" # Chave única para evitar conflitos de tela
-                )
-                
-                # Sincroniza as alterações de volta para a memória central em tempo real
-                for _, row in edited_df.iterrows():
-                    g_id = int(row['ID_Global'])
-                    if st.session_state.deteccoes[g_id]['Aprovado'] != row['Aprovado']:
-                        st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
-                        st.rerun() # Atualiza toda a tela instantaneamente
+                if 'odo_ref' in img_atual and 'lado' in img_atual:
+                    mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado'])
+                    df_imagem_atual = df_raw[mask].copy()
+                    
+                    edited_df = st.data_editor(
+                        df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Comprimento(mm)', 'Aprovado']],
+                        column_config={
+                            "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
+                            "ID_Global": None, 
+                            "ID_Img": st.column_config.TextColumn("Ref na Imagem")
+                        },
+                        disabled=['ID_Img', 'Classe', 'Comprimento(mm)'], 
+                        hide_index=True,
+                        use_container_width=True,
+                        key=f"editor_img_{img_idx}" 
+                    )
+                    
+                    for _, row in edited_df.iterrows():
+                        g_id = int(row['ID_Global'])
+                        if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
+                            st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
+                            st.rerun() 
+                else:
+                    st.warning("Detectamos dados antigos de galeria nesta sessão. Clique em 'Resetar Sistema' e faça a inferência novamente para usar a Auditoria.")
         else:
             st.info("Nenhuma detecção para auditar.")
 
     # -----------------------------------------------------------------
-    # ABA 3: GALERIA DE IMAGENS (Antiga Aba 2)
+    # ABA 3: GALERIA DE IMAGENS
     # -----------------------------------------------------------------
     with aba_galeria:
         st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão no canto superior direito para visualizá-la em tela cheia.")
