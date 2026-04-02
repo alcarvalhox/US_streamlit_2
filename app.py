@@ -86,7 +86,7 @@ if 'deteccoes' not in st.session_state: st.session_state.deteccoes = []
 if 'img_gallery' not in st.session_state: st.session_state.img_gallery = []
 if 'page' not in st.session_state: st.session_state.page = 0
 if 'audit_idx' not in st.session_state: st.session_state.audit_idx = 0 
-if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0 # Chave para resetar o upload de arquivos
+if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0 
 
 # =====================================================================
 # 2. ROTINAS DE PARIDADE TOTAL E OTIMIZAÇÃO (CACHE E OPENCV)
@@ -145,12 +145,11 @@ col_upload, col_botoes = st.columns([3, 1])
 with col_upload:
     files = st.file_uploader(
         "Faça o Upload dos arquivos CSV", 
-        type=['csv'], # Regra 1: Só permite selecionar extensão CSV
+        type=['csv'], 
         accept_multiple_files=True,
-        key=f"uploader_{st.session_state.uploader_key}" # Chave dinâmica para botão limpar
+        key=f"uploader_{st.session_state.uploader_key}" 
     )
     
-    # --- Regra 2: Validação rigorosa das colunas ---
     arquivos_prontos = False
     if files:
         colunas_esperadas = {'odo', 'frame', 'probe', 'depth', 'sample', 'level'}
@@ -158,14 +157,13 @@ with col_upload:
         
         for f in files:
             try:
-                # Lê apenas a primeira linha para validar os nomes das colunas rapidamente
                 df_header = pd.read_csv(f, nrows=0)
                 colunas_atuais = set(df_header.columns)
                 
                 if not colunas_esperadas.issubset(colunas_atuais):
                     st.error(f"⚠️ **Erro no arquivo:** `{f.name}`\n\nO formato está fora do padrão aceito. O arquivo deve conter obrigatoriamente as colunas: `odo`, `frame`, `probe`, `depth`, `sample`, `level`.")
                     arquivos_validos = False
-                    break # Para a validação no primeiro erro encontrado
+                    break 
             except Exception as e:
                 st.error(f"⚠️ **Erro de Leitura:** Não foi possível ler o arquivo `{f.name}`. Verifique se ele não está corrompido.")
                 arquivos_validos = False
@@ -177,12 +175,10 @@ with col_upload:
 
 with col_botoes:
     st.markdown("<br>", unsafe_allow_html=True)
-    # O botão de iniciar só é ativado se a validação passar (arquivos_prontos == True)
     btn_run = st.button("🚀 Iniciar Inferência", type="primary", use_container_width=True, disabled=not arquivos_prontos)
     
-    # Novo botão para limpar apenas os arquivos sem resetar os resultados da tela
     if st.button("🧹 Limpar Arquivos", use_container_width=True):
-        st.session_state.uploader_key += 1 # Altera a chave, forçando o Streamlit a esvaziar a caixa de upload
+        st.session_state.uploader_key += 1 
         st.rerun()
 
     if st.button("🗑️ Resetar Sistema", use_container_width=True):
@@ -190,7 +186,7 @@ with col_botoes:
         st.session_state.img_gallery = []
         st.session_state.page = 0 
         st.session_state.audit_idx = 0 
-        st.session_state.uploader_key += 1 # Limpa os arquivos também
+        st.session_state.uploader_key += 1 
         st.cache_resource.clear()
         st.cache_data.clear() 
         st.rerun()
@@ -229,7 +225,11 @@ if btn_run and arquivos_prontos:
                 
                 if len(df_win) > 5:
                     img = generate_bscan_buffer(df_win, start, end)
-                    results = model.predict(img, verbose=False, conf=0.3)
+                    
+                    # --- NMS AJUSTADO PARA EVITAR DUPLICIDADE ---
+                    # iou=0.4: Suprime caixas com mais de 40% de sobreposição
+                    # agnostic_nms=True: Suprime caixas sobrepostas independente da classe
+                    results = model.predict(img, verbose=False, conf=0.3, iou=0.4, agnostic_nms=True)
                     
                     if len(results[0].boxes) > 0:
                         img_draw = img.copy()
@@ -389,14 +389,15 @@ if st.session_state.deteccoes:
                     mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado'])
                     df_imagem_atual = df_raw[mask].copy()
                     
+                    # --- TABELA DE AUDITORIA ATUALIZADA (INCLUINDO CONFIANÇA) ---
                     edited_df = st.data_editor(
-                        df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Comprimento(mm)', 'Aprovado']],
+                        df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
                         column_config={
                             "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
                             "ID_Global": None, 
                             "ID_Img": st.column_config.TextColumn("Ref na Imagem")
                         },
-                        disabled=['ID_Img', 'Classe', 'Comprimento(mm)'], 
+                        disabled=['ID_Img', 'Classe', 'Confiança', 'Comprimento(mm)'], # Trava edição das colunas informativas
                         hide_index=True,
                         use_container_width=True,
                         key=f"editor_img_{img_idx}" 
