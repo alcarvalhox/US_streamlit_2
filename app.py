@@ -192,7 +192,7 @@ with col_botoes:
         st.rerun()
 
 # =====================================================================
-# 4. PROCESSAMENTO E INFERÊNCIA COM FILTRO CUSTOMIZADO
+# 4. PROCESSAMENTO E INFERÊNCIA COM NMS CUSTOMIZADO POR ÁREA
 # =====================================================================
 if btn_run and arquivos_prontos:
     st.session_state.page = 0 
@@ -225,10 +225,11 @@ if btn_run and arquivos_prontos:
                 
                 if len(df_win) > 5:
                     img = generate_bscan_buffer(df_win, start, end)
-                    results = model.predict(img, verbose=False, conf=0.3)
+                    
+                    # --- Alteração: Threshold para 0.5 (Confiança > 50%) ---
+                    results = model.predict(img, verbose=False, conf=0.5)
                     
                     if len(results[0].boxes) > 0:
-                        # --- PASSO 1: Extrair e ordenar predições por confiança ---
                         raw_dets = []
                         for box in results[0].boxes:
                             bx = box.xyxy[0].cpu().numpy().astype(int)
@@ -241,29 +242,39 @@ if btn_run and arquivos_prontos:
                         # Ordena da maior para a menor confiança
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
 
-                        # --- PASSO 2: Supressão Espacial Customizada (Deduplicação) ---
+                        # --- NOVO NMS (Baseado em Área) ---
                         final_dets = []
-                        RAIO_EXCLUSAO_PX = 30 # Distância mínima em pixels entre dois centros
-
                         for d in raw_dets:
-                            x1, y1, x2, y2 = d['box']
-                            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+                            bx1 = d['box']
                             duplicado = False
 
                             for f in final_dets:
-                                fx1, fy1, fx2, fy2 = f['box']
-                                fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
-                                dist = np.sqrt((cx - fcx)**2 + (cy - fcy)**2)
+                                bx2 = f['box']
+                                
+                                # Verifica a sobreposição geométrica
+                                x_left = max(bx1[0], bx2[0])
+                                y_top = max(bx1[1], bx2[1])
+                                x_right = min(bx1[2], bx2[2])
+                                y_bottom = min(bx1[3], bx2[3])
 
-                                # Se o centro da caixa atual estiver muito perto de uma caixa já validada
-                                if dist < RAIO_EXCLUSAO_PX:
-                                    duplicado = True
-                                    break
+                                if x_right > x_left and y_bottom > y_top:
+                                    inter_area = (x_right - x_left) * (y_bottom - y_top)
+                                    area1 = (bx1[2] - bx1[0]) * (bx1[3] - bx1[1])
+                                    area2 = (bx2[2] - bx2[0]) * (bx2[3] - bx2[1])
+                                    
+                                    # Calcula a porcentagem em relação à caixa MENOR
+                                    min_area = min(area1, area2)
+                                    overlap_ratio = inter_area / min_area if min_area > 0 else 0
+                                    
+                                    # Se invadir mais de 10% da caixa menor, considera duplicata
+                                    if overlap_ratio > 0.10:
+                                        duplicado = True
+                                        break
 
                             if not duplicado:
                                 final_dets.append(d)
 
-                        # --- PASSO 3: Desenhar e salvar apenas as caixas filtradas ---
+                        # --- Desenhar e salvar apenas as caixas filtradas ---
                         if final_dets:
                             img_draw = img.copy()
                             h, w, _ = img.shape
