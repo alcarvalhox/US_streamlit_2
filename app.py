@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import os
+import base64 # Novo import necessário para processar as imagens no cabeçalho
 
 # =====================================================================
 # 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
@@ -89,11 +90,24 @@ h1, h2, h3, p, label, .stMarkdown, .stText {
 """
 st.markdown(cores_mrs, unsafe_allow_html=True)
 
+# Função auxiliar para garantir alinhamento perfeito e bordas estilizadas
+def load_image_b64(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
 # Colunas simétricas (1, 4, 1) para: Logo, Título Centralizado e Veículo
 col_logo, col_titulo, col_veiculo = st.columns([1, 4, 1])
+
 with col_logo:
     try:
-        st.image("logo.png", width=150)
+        img_logo = load_image_b64("logo.png")
+        # Centraliza a logo na coluna
+        st.markdown(
+            f'<div style="display: flex; justify-content: center; align-items: center; height: 100%;">'
+            f'<img src="data:image/png;base64,{img_logo}" style="width: 150px; max-width: 100%;">'
+            f'</div>', 
+            unsafe_allow_html=True
+        )
     except:
         st.warning("⚠️ Logo não encontrada.")
         
@@ -103,8 +117,14 @@ with col_titulo:
     
 with col_veiculo:
     try:
-        # Colocando a imagem do veículo à direita do título
-        st.image("veiculo_us.jpg", width=150)
+        img_veiculo = load_image_b64("veiculo_us.jpg")
+        # Centraliza o veículo e aplica bordas arredondadas e sombra suave
+        st.markdown(
+            f'<div style="display: flex; justify-content: center; align-items: center; height: 100%;">'
+            f'<img src="data:image/jpeg;base64,{img_veiculo}" style="width: 150px; max-width: 100%; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">'
+            f'</div>', 
+            unsafe_allow_html=True
+        )
     except:
         st.warning("⚠️ Imagem do veículo não encontrada.")
 
