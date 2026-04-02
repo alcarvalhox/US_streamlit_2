@@ -94,9 +94,10 @@ col_logo, col_titulo, col_veiculo = st.columns([1, 4, 1])
 with col_logo:
     try:
         img_logo = load_image_b64("logo.png")
+        # Inserido margin-top, border-radius e box-shadow para ficar igual ao veículo
         st.markdown(
-            f'<div style="display: flex; justify-content: center; align-items: center; height: 100%;">'
-            f'<img src="data:image/png;base64,{img_logo}" style="width: 160px; height: 110px; object-fit: contain;">'
+            f'<div style="display: flex; justify-content: center; align-items: center; height: 100%; margin-top: 20px;">'
+            f'<img src="data:image/png;base64,{img_logo}" style="width: 160px; height: 110px; object-fit: contain; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">'
             f'</div>', 
             unsafe_allow_html=True
         )
@@ -109,7 +110,6 @@ with col_titulo:
 with col_veiculo:
     try:
         img_veiculo = load_image_b64("veiculo_us.jpg")
-        # Inserido o margin-top: 20px na div abaixo para afastar a imagem do topo
         st.markdown(
             f'<div style="display: flex; justify-content: center; align-items: center; height: 100%; margin-top: 20px;">'
             f'<img src="data:image/jpeg;base64,{img_veiculo}" style="width: 160px; height: 110px; object-fit: cover; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);">'
