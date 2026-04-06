@@ -23,6 +23,7 @@ import pandas as pd
 import numpy as np
 import cv2
 import io
+import zipfile
 from ultralytics import YOLO
 from datetime import datetime
 from scipy.spatial import cKDTree
@@ -137,6 +138,32 @@ def generate_bscan_buffer(df_win, start, end):
             cv2.fillPoly(img, [base_triangle + [x, y]], probe_to_bgr.get(p, (0, 255, 255)))
     return img
 
+def gerar_zip_dataset():
+    """Gera um arquivo ZIP com as pastas images/ e labels/ no padrão YOLO."""
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for item in st.session_state.img_gallery:
+            # Pula se a imagem original limpa não estiver disponível (fallback de segurança)
+            if 'img_clean' not in item: continue
+            
+            nome_base = f"{item['lado']}_{item['odo_ref']}"
+            
+            # 1. Salvar Imagem Limpa
+            _, buffer_img = cv2.imencode(".jpg", item['img_clean'])
+            zip_file.writestr(f"images/{nome_base}.jpg", buffer_img.tobytes())
+            
+            # 2. Salvar Labels Aprovadas
+            linhas_yolo = []
+            for det in st.session_state.deteccoes:
+                if det['ODO_Ref'] == item['odo_ref'] and det['Lado'] == item['lado'] and det['Aprovado']:
+                    linhas_yolo.append(det['yolo_bbox'])
+            
+            # Cria o arquivo .txt (se vazio, serve para Negative Mining)
+            conteudo_txt = "\n".join(linhas_yolo)
+            zip_file.writestr(f"labels/{nome_base}.txt", conteudo_txt)
+            
+    return zip_buffer.getvalue()
+
 # =====================================================================
 # 3. INTERFACE, CONTROLES E VALIDAÇÃO DE ARQUIVOS
 # =====================================================================
@@ -192,7 +219,7 @@ with col_botoes:
         st.rerun()
 
 # =====================================================================
-# 4. PROCESSAMENTO E INFERÊNCIA COM NMS CUSTOMIZADO POR ÁREA
+# 4. PROCESSAMENTO E INFERÊNCIA COM EXPORTAÇÃO YOLO
 # =====================================================================
 if btn_run and arquivos_prontos:
     st.session_state.page = 0 
@@ -225,8 +252,8 @@ if btn_run and arquivos_prontos:
                 
                 if len(df_win) > 5:
                     img = generate_bscan_buffer(df_win, start, end)
+                    img_clean = img.copy() # Salva a imagem original sem anotações para exportação
                     
-                    # --- Alteração: Threshold para 0.5 (Confiança > 50%) ---
                     results = model.predict(img, verbose=False, conf=0.5)
                     
                     if len(results[0].boxes) > 0:
@@ -236,13 +263,12 @@ if btn_run and arquivos_prontos:
                             raw_dets.append({
                                 'box': bx,
                                 'conf': float(box.conf),
-                                'cls_nome': model.names[int(box.cls)]
+                                'cls_nome': model.names[int(box.cls)],
+                                'cls_id': int(box.cls) # Guardamos o ID numérico da classe para o YOLO
                             })
                         
-                        # Ordena da maior para a menor confiança
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
 
-                        # --- NOVO NMS (Baseado em Área) ---
                         final_dets = []
                         for d in raw_dets:
                             bx1 = d['box']
@@ -250,23 +276,16 @@ if btn_run and arquivos_prontos:
 
                             for f in final_dets:
                                 bx2 = f['box']
-                                
-                                # Verifica a sobreposição geométrica
-                                x_left = max(bx1[0], bx2[0])
-                                y_top = max(bx1[1], bx2[1])
-                                x_right = min(bx1[2], bx2[2])
-                                y_bottom = min(bx1[3], bx2[3])
+                                x_left, y_top = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
+                                x_right, y_bottom = min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
 
                                 if x_right > x_left and y_bottom > y_top:
                                     inter_area = (x_right - x_left) * (y_bottom - y_top)
                                     area1 = (bx1[2] - bx1[0]) * (bx1[3] - bx1[1])
                                     area2 = (bx2[2] - bx2[0]) * (bx2[3] - bx2[1])
-                                    
-                                    # Calcula a porcentagem em relação à caixa MENOR
                                     min_area = min(area1, area2)
                                     overlap_ratio = inter_area / min_area if min_area > 0 else 0
                                     
-                                    # Se invadir mais de 10% da caixa menor, considera duplicata
                                     if overlap_ratio > 0.10:
                                         duplicado = True
                                         break
@@ -274,7 +293,6 @@ if btn_run and arquivos_prontos:
                             if not duplicado:
                                 final_dets.append(d)
 
-                        # --- Desenhar e salvar apenas as caixas filtradas ---
                         if final_dets:
                             img_draw = img.copy()
                             h, w, _ = img.shape
@@ -284,13 +302,23 @@ if btn_run and arquivos_prontos:
                                 x1, y1, x2, y2 = d['box']
                                 classe_nome = d['cls_nome']
                                 conf_val = d['conf']
+                                cls_id = d['cls_id']
                                 
+                                # --- Cálculos Relativos (Normalizados) para exportação YOLO ---
+                                cx_norm = ((x1 + x2) / 2.0) / float(w)
+                                cy_norm = ((y1 + y2) / 2.0) / float(h)
+                                w_norm = float(x2 - x1) / float(w)
+                                h_norm = float(y2 - y1) / float(h)
+                                string_yolo = f"{cls_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}"
+                                
+                                # Desenho visual
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0, 0, 255), 2)
                                 texto = f"#{local_id} {classe_nome}"
                                 (w_txt, h_txt), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
                                 cv2.rectangle(img_draw, (x1, y1 - 25), (x1 + w_txt + 5, y1), (0, 0, 255), -1)
                                 cv2.putText(img_draw, texto, (x1 + 2, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                                 
+                                # Cálculos Físicos
                                 px1, px2 = x1/w, x2/w
                                 py1, py2 = y1/h, y2/h
                                 center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
@@ -307,12 +335,14 @@ if btn_run and arquivos_prontos:
                                     'Coordenada Depth(mm)': int(center_y_mm),
                                     'Comprimento(mm)': comprimento,
                                     'Confiança': f"{conf_val:.2%}",
-                                    'Aprovado': True
+                                    'Aprovado': True,
+                                    'yolo_bbox': string_yolo # Guardado invisível na memória para exportação
                                 })
                                 local_id += 1
                                 
                             gallery.append({
                                 "img": img_draw, 
+                                "img_clean": img_clean, # Salva a original sem desenhos
                                 "label": f"{lado_nome} @ {start}", 
                                 "odo_ref": start, 
                                 "lado": lado_nome
@@ -338,9 +368,13 @@ if st.session_state.deteccoes:
     if 'ID_Img' not in df_raw.columns:
         df_raw['ID_Img'] = "#-"
     
-    df_aprovados = df_raw[df_raw['Aprovado'] == True].drop(columns=['ID_Global', 'Aprovado', 'ID_Img'])
+    # Prepara visualização (esconde colunas técnicas)
+    colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img']
+    if 'yolo_bbox' in df_raw.columns: colunas_esconder.append('yolo_bbox')
     
-    aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria de Falsos Positivos", "🖼️ Galeria Geral"])
+    df_aprovados = df_raw[df_raw['Aprovado'] == True].drop(columns=colunas_esconder)
+    
+    aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
     
     # -----------------------------------------------------------------
     # ABA 1: TABELAS
@@ -389,7 +423,7 @@ if st.session_state.deteccoes:
             st.dataframe(df_filtrado, hide_index=True, use_container_width=True)
             
     # -----------------------------------------------------------------
-    # ABA 2: AUDITORIA (NAVEGAÇÃO POR SETAS)
+    # ABA 2: AUDITORIA E EXPORTAÇÃO
     # -----------------------------------------------------------------
     with aba_auditoria:
         st.markdown("##### Selecione a imagem para avaliar os defeitos encontrados:")
@@ -427,7 +461,7 @@ if st.session_state.deteccoes:
                 
             with col_dir:
                 st.markdown("#### Validar Detecções")
-                st.markdown("Desmarque a caixa para excluir um Falso Positivo do Relatório Final.")
+                st.markdown("Desmarque a caixa para excluir um Falso Positivo do Relatório Final e do arquivo de Retreinamento.")
                 
                 if 'odo_ref' in img_atual and 'lado' in img_atual:
                     mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado'])
@@ -453,6 +487,23 @@ if st.session_state.deteccoes:
                             st.rerun() 
                 else:
                     st.warning("Detectamos dados antigos de galeria nesta sessão. Clique em 'Resetar Sistema' e faça a inferência novamente para usar a Auditoria.")
+            
+            # --- SEÇÃO DE EXPORTAÇÃO (ACTIVE LEARNING) ---
+            st.markdown("<br><hr>", unsafe_allow_html=True)
+            st.markdown("#### 📦 Exportar Dataset para Retreinamento (YOLOv8)")
+            st.markdown("Gere um pacote `.zip` com as imagens limpas e as anotações corrigidas. Imagens com detecções 'Reprovadas' gerarão anotações vazias, forçando o modelo a aprender através do *Negative Mining*.")
+            
+            if 'img_clean' in st.session_state.img_gallery[0]:
+                st.download_button(
+                    label="⬇️ Baixar Dataset ZIP",
+                    data=gerar_zip_dataset(),
+                    file_name=f"dataset_retreino_us_{datetime.now().strftime('%d%m%H%M')}.zip",
+                    mime="application/zip",
+                    use_container_width=False
+                )
+            else:
+                st.info("Para exportar, faça uma nova inferência (arquivos antigos em memória não possuem as imagens originais limpas).")
+            
         else:
             st.info("Nenhuma detecção para auditar.")
 
