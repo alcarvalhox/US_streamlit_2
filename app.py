@@ -467,14 +467,15 @@ if st.session_state.deteccoes:
                     mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado'])
                     df_imagem_atual = df_raw[mask].copy()
                     
+                    # === ATUALIZAÇÃO: INCLUSÃO DA COLUNA DE PROFUNDIDADE NA AUDITORIA ===
                     edited_df = st.data_editor(
-                        df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
+                        df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
                         column_config={
                             "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
                             "ID_Global": None, 
                             "ID_Img": st.column_config.TextColumn("Ref na Imagem")
                         },
-                        disabled=['ID_Img', 'Classe', 'Confiança', 'Comprimento(mm)'], 
+                        disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)'], 
                         hide_index=True,
                         use_container_width=True,
                         key=f"editor_img_{img_idx}" 
