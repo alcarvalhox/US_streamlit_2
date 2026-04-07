@@ -41,7 +41,7 @@ LIMITES_PROFUNDIDADE = {
     "Patim": (180, 223)
 }
 
-# Separação por Sonda continua apenas para Lado Esquerdo / Direito
+# Separação por Sonda (Lado Esquerdo / Direito)
 SONDAS_ESQUERDA = [0, 6, 8, 4, 10]
 SONDAS_DIREITA = [1, 7, 9, 5, 11]
 
@@ -219,7 +219,7 @@ with col_botoes:
     st.markdown("<br>", unsafe_allow_html=True)
     btn_run = st.button("🚀 Iniciar Inferências", type="primary", use_container_width=True, disabled=not arquivos_prontos)
     
-    if st.button("🧹 Limpar Arquivos", use_container_width=True):
+    if st.button("🧹 Limpar Caixa de Upload", use_container_width=True):
         st.session_state.uploader_key += 1 
         st.rerun()
 
@@ -288,7 +288,10 @@ if btn_run and arquivos_prontos:
                 if len(df_win) > 5:
                     img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
-                    results = model.predict(img_clean, verbose=False, conf=0.5)
+                    
+                    # ⚠️ CORREÇÃO DA TALA ISOLADA: Redução de conf=0.50 para conf=0.25 (Padrão YOLO) 
+                    # para permitir a captura de classes maiores e mais dispersas.
+                    results = model.predict(img_clean, verbose=False, conf=0.25)
                     
                     if len(results[0].boxes) > 0:
                         raw_dets = []
@@ -298,16 +301,21 @@ if btn_run and arquivos_prontos:
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
                         final_dets = []
                         
-                        # --- CORREÇÃO DO NMS PARA CLASSES DISTINTAS (TALA vs TD/DS) ---
                         for d in raw_dets:
                             bx1, duplicado = d['box'], False
                             for f in final_dets:
-                                # Regra: Só suprime a caixa se ela for DA MESMA CLASSE
                                 if d['cls_id'] == f['cls_id']:
                                     bx2 = f['box']
                                     xl, yt, xr, yb = max(bx1[0], bx2[0]), max(bx1[1], bx2[1]), min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
                                     if xr > xl and yb > yt:
-                                        if ((xr-xl)*(yb-yt) / min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))) > 0.10:
+                                        area_inter = (xr-xl)*(yb-yt)
+                                        area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
+                                        
+                                        # ⚠️ CORREÇÃO DA TALA ISOLADA: Afrouxamento do NMS de 10% para 40% de sobreposição
+                                        # Evita que a caixa de uma Tala "engula" as bordas de outra caixa fragmentada
+                                        limite_nms = 0.40 if d['cls_nome'] == 'Tala_Isolada' else 0.10
+                                        
+                                        if (area_inter / area_min) > limite_nms:
                                             duplicado = True; break
                             if not duplicado: final_dets.append(d)
 
@@ -363,84 +371,115 @@ if st.session_state.deteccoes or st.session_state.img_gallery:
         
     st.markdown("<h4 style='color: #FFC600; text-align: center;'>Alternar Visualização de Tabelas e Modelos:</h4>", unsafe_allow_html=True)
     
-    # --- RÁDIO COM NOVO BOTÃO DE VISÃO GLOBAL ---
     locais_fixos = ["Alma", "Boleto", "Patim", "🌐 Visão Global"]
     local_selecionado = st.radio("Selecione:", locais_fixos, horizontal=True, label_visibility="collapsed")
     
-    # Lógica de Filtro baseada na Seleção
+    # =====================================================================
+    # BLOCO: 🌐 VISÃO GLOBAL (Apenas Tabela de Dados e Relatório Geral)
+    # =====================================================================
     if local_selecionado == "🌐 Visão Global":
-        df_local_atual = df_raw.copy()
-        galeria_local_atual = [] # Galeria não se aplica na visão global
+        aba_dados = st.tabs(["📊 Tabelas e Relatório Global"])[0]
+        
+        with aba_dados:
+            col_resumo, col_filtros = st.columns([1, 2])
+            df_aprovados_global = df_raw[df_raw['Aprovado'] == True].copy() if not df_raw.empty else pd.DataFrame()
+            
+            with col_resumo:
+                st.markdown("##### 📈 Resumo Geral (Aprovados)")
+                if not df_aprovados_global.empty:
+                    contagem_classes = df_aprovados_global['Classe'].value_counts().reset_index()
+                    contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
+                    st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
+                else:
+                    st.info("Nenhum defeito aprovado na via toda.")
+            
+            with col_filtros:
+                st.markdown("##### 🔍 Refinar Busca Global")
+                cf1, cf2, cf3 = st.columns(3)
+                with cf1:
+                    classes_disp = df_aprovados_global['Classe'].unique() if not df_aprovados_global.empty else []
+                    filtro_classe = st.multiselect("Classe:", options=classes_disp, default=classes_disp)
+                with cf2:
+                    lados_disp = df_aprovados_global['Lado'].unique() if not df_aprovados_global.empty else []
+                    filtro_lado = st.multiselect("Lado:", options=lados_disp, default=lados_disp)
+                with cf3:
+                    loc_disp = df_aprovados_global['Local'].unique() if not df_aprovados_global.empty else []
+                    filtro_local = st.multiselect("Local:", options=loc_disp, default=loc_disp)
+                    
+            if not df_aprovados_global.empty:
+                df_filtrado_global = df_aprovados_global[
+                    (df_aprovados_global['Classe'].isin(filtro_classe)) & 
+                    (df_aprovados_global['Lado'].isin(filtro_lado)) &
+                    (df_aprovados_global['Local'].isin(filtro_local))
+                ]
+                
+                colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
+                df_final_export = df_filtrado_global.drop(columns=colunas_esconder, errors='ignore')
+                
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.dataframe(df_final_export, hide_index=True, use_container_width=True)
+                
+                st.markdown("<hr>", unsafe_allow_html=True)
+                col_down, _ = st.columns([1, 2])
+                with col_down:
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df_final_export.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
+                    excel_data = output.getvalue()
+                    
+                    st.download_button(
+                        label="📥 Baixar Relatório Unificado (Excel)", 
+                        data=excel_data, 
+                        file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True,
+                        type="primary"
+                    )
+                    
+    # =====================================================================
+    # BLOCO: VISÃO POR MODELO ESPECÍFICO (Alma, Boleto, Patim)
+    # =====================================================================
     else:
         df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy() if not df_raw.empty else pd.DataFrame()
         galeria_local_atual = [item for item in st.session_state.img_gallery if item.get('local') == local_selecionado]
-    
-    if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
-    if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
-    
-    colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
-    df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore') if not df_local_atual.empty else pd.DataFrame()
-    
-    aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
-    
-    # -----------------------------------------------------------------
-    # ABA 1: TABELAS
-    # -----------------------------------------------------------------
-    with aba_dados:
-        col_resumo, col_filtros = st.columns([1, 2])
         
-        with col_resumo:
-            st.markdown(f"##### 📈 Resumo - {local_selecionado} (Aprovados)")
+        if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
+        if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
+        
+        colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
+        df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore') if not df_local_atual.empty else pd.DataFrame()
+        
+        aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
+        
+        with aba_dados:
+            col_resumo, col_filtros = st.columns([1, 2])
+            
+            with col_resumo:
+                st.markdown(f"##### 📈 Resumo - {local_selecionado} (Aprovados)")
+                if not df_aprovados_local.empty:
+                    contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
+                    contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
+                    st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
+                else:
+                    st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
+                
+            with col_filtros:
+                st.markdown("##### 🔍 Refinar Busca")
+                cf1, cf2 = st.columns(2)
+                with cf1:
+                    classes_disp = df_aprovados_local['Classe'].unique() if not df_aprovados_local.empty else []
+                    filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disp, default=classes_disp)
+                with cf2:
+                    lados_disp = df_aprovados_local['Lado'].unique() if not df_aprovados_local.empty else []
+                    filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disp, default=lados_disp)
+                    
             if not df_aprovados_local.empty:
-                contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
-                contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
-            else:
-                st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
-            
-        with col_filtros:
-            st.markdown("##### 🔍 Refinar Busca")
-            cf1, cf2 = st.columns(2)
-            with cf1:
-                classes_disp = df_aprovados_local['Classe'].unique() if not df_aprovados_local.empty else []
-                filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disp, default=classes_disp)
-            with cf2:
-                lados_disp = df_aprovados_local['Lado'].unique() if not df_aprovados_local.empty else []
-                filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disp, default=lados_disp)
-                
-        if not df_aprovados_local.empty:
-            df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
-            st.markdown("<br>", unsafe_allow_html=True)
-            st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
-            
-        # O DOWNLOAD GERAL AGORA FICA CONDICIONADO À VISÃO GLOBAL
-        if local_selecionado == "🌐 Visão Global" and not df_raw.empty:
-            st.markdown("<hr>", unsafe_allow_html=True)
-            col_down, col_vazia2 = st.columns([1, 2])
-            with col_down:
-                df_aprovados_global = df_raw[df_raw['Aprovado'] == True].drop(columns=['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox'], errors='ignore')
-                
-                output = io.BytesIO()
-                with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_aprovados_global.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
-                excel_data = output.getvalue()
-                
-                st.download_button(
-                    label="📥 Baixar Relatório Unificado em Excel", 
-                    data=excel_data, 
-                    file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
-                    type="primary"
-                )
-            
-    # -----------------------------------------------------------------
-    # ABA 2: AUDITORIA E EXPORTAÇÃO
-    # -----------------------------------------------------------------
-    with aba_auditoria:
-        if local_selecionado == "🌐 Visão Global":
-            st.info("⚠️ A auditoria de imagens e extração de retreinamento deve ser feita separadamente. Selecione 'Alma', 'Boleto' ou 'Patim' no menu acima.")
-        else:
+                df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
+                st.markdown("<br>", unsafe_allow_html=True)
+                st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
+                # Nota: Botão de download removido daqui conforme solicitado. Acesse pela Visão Global.
+
+        with aba_auditoria:
             total_imagens_det = len(galeria_local_atual)
             if total_imagens_det > 0:
                 col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
@@ -513,13 +552,7 @@ if st.session_state.deteccoes or st.session_state.img_gallery:
                 else:
                     st.info(f"Nenhuma imagem correspondente a {local_selecionado} para auditar.")
 
-    # -----------------------------------------------------------------
-    # ABA 3: GALERIA DE IMAGENS
-    # -----------------------------------------------------------------
-    with aba_galeria:
-        if local_selecionado == "🌐 Visão Global":
-            st.info("⚠️ Selecione 'Alma', 'Boleto' ou 'Patim' no menu acima para visualizar as galerias de imagens geradas.")
-        else:
+        with aba_galeria:
             st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão para tela cheia.")
             
             itens_por_pagina = 20
