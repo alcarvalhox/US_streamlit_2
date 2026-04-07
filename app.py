@@ -155,7 +155,7 @@ def gerar_zip_dataset():
         for item in st.session_state.img_gallery:
             if 'img_clean' not in item: continue
             
-            local = item['local'] # Alma, Boleto ou Patim
+            local = item.get('local', 'Alma') # Proteção para dados antigos
             nome_base = f"{item['lado']}_{item['odo_ref']}"
             
             # Salva na pasta do respectivo modelo/região (ex: Alma/images/Trilho_Esq_100.jpg)
@@ -164,7 +164,7 @@ def gerar_zip_dataset():
             
             linhas_yolo = []
             for det in st.session_state.deteccoes:
-                if det['ODO_Ref'] == item['odo_ref'] and det['Lado'] == item['lado'] and det['Local'] == local and det['Aprovado']:
+                if det['ODO_Ref'] == item['odo_ref'] and det['Lado'] == item['lado'] and det.get('Local', 'Alma') == local and det['Aprovado']:
                     linhas_yolo.append(det['yolo_bbox'])
             
             zip_file.writestr(f"{local}/labels/{nome_base}.txt", "\n".join(linhas_yolo))
@@ -330,13 +330,24 @@ if st.session_state.deteccoes:
     st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
     
     df_raw = pd.DataFrame(st.session_state.deteccoes)
+    
+    # --- PROTEÇÃO CONTRA CACHE ANTIGO ---
+    if 'Local' not in df_raw.columns:
+        df_raw['Local'] = "Alma" # Atribui Alma para dados velhos da memória
+    if 'Aprovado' not in df_raw.columns:
+        df_raw['Aprovado'] = True
+    if 'ID_Global' not in df_raw.columns:
+        df_raw['ID_Global'] = df_raw.index
+    if 'ID_Img' not in df_raw.columns:
+        df_raw['ID_Img'] = "#-"
+        
     locais_disponiveis = list(df_raw['Local'].unique())
     
     st.markdown("<h4 style='color: #FFC600;'>Visualizar Resultados do Modelo:</h4>", unsafe_allow_html=True)
     local_selecionado = st.radio("Selecione:", locais_disponiveis, horizontal=True, label_visibility="collapsed")
     
     df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy()
-    galeria_local_atual = [item for item in st.session_state.img_gallery if item['local'] == local_selecionado]
+    galeria_local_atual = [item for item in st.session_state.img_gallery if item.get('local', 'Alma') == local_selecionado]
     
     if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
     if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
