@@ -4,7 +4,7 @@ import os
 import base64
 
 # =====================================================================
-# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS E CONFIGURAÇÃO
+# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS E CONFIGURAÇÃO DE MODELOS
 # =====================================================================
 def install_dependencies():
     if os.path.exists("requirements.txt"):
@@ -34,6 +34,17 @@ CONFIG_MODELOS = {
     "Patim": "best_patim_1.pt"
 }
 
+# --- LIMITES ANATÔMICOS EM PROFUNDIDADE (DEPTH) ---
+LIMITES_PROFUNDIDADE = {
+    "Boleto": (0, 52),
+    "Alma": (53, 179),
+    "Patim": (180, 223)
+}
+
+# Separação por Sonda continua apenas para Lado Esquerdo / Direito
+SONDAS_ESQUERDA = [0, 6, 8, 4, 10]
+SONDAS_DIREITA = [1, 7, 9, 5, 11]
+
 # =====================================================================
 # 1. CONFIGURAÇÕES, TÍTULO E ESTILO
 # =====================================================================
@@ -56,9 +67,12 @@ h1, h2, h3, p, label, .stMarkdown, .stText { color: white !important; }
 }
 .stButton>button:hover, [data-testid="stDownloadButton"] button:hover { background-color: #e6b300; color: white !important; }
 .stDataFrame { background-color: white; border-radius: 5px; }
-div.row-widget.stRadio > div{flex-direction:row;}
+div.row-widget.stRadio > div{flex-direction:row; justify-content: center;}
 div.row-widget.stRadio > div > label{
-    background-color: #FFC600; padding: 10px 20px; border-radius: 5px; color:#003865 !important; font-weight: bold; margin-right: 10px; cursor: pointer;
+    background-color: #FFC600; padding: 10px 30px; border-radius: 5px; color:#003865 !important; font-weight: bold; margin-right: 15px; cursor: pointer; border: 2px solid transparent;
+}
+div.row-widget.stRadio > div > label[data-checked="true"] {
+    border: 2px solid white; background-color: #e6b300;
 }
 </style>
 """
@@ -100,15 +114,6 @@ if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0
 # =====================================================================
 # 2. ROTINAS DE PARIDADE TOTAL E OTIMIZAÇÃO (CACHE E OPENCV)
 # =====================================================================
-@st.cache_data
-def ler_e_preparar_dados(arquivos):
-    for f in arquivos: f.seek(0)
-    df_raw = pd.concat([pd.read_csv(f) for f in arquivos]).sort_values(by='odo')
-    df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
-    df_esq = df_raw[df_raw['probe'].isin([0, 6, 8, 4, 10]) & (df_raw['level'] > 450)]
-    df_dir = df_raw[df_raw['probe'].isin([1, 7, 9, 5, 11]) & (df_raw['level'] > 450)]
-    return df_esq, df_dir
-
 def remover_pontos_isolados(df, raio=10):
     if df.empty: return df
     coords = df[['odo', 'depth']].values
@@ -132,15 +137,22 @@ def load_ov_model(nome_pt):
             return None 
     return YOLO(path_ov, task='detect')
 
-def generate_bscan_buffer(df_win, start, end):
+def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     width, height = 1500, 500
     img = np.full((height, width, 3), 255, dtype=np.uint8)
     probe_to_bgr = { 0: (0, 255, 255), 1: (0, 255, 255), 6: (0, 128, 0), 7: (0, 128, 0), 8: (128, 0, 128), 9: (128, 0, 128), 4: (0, 0, 255), 5: (0, 0, 255), 10: (255, 0, 0), 11: (255, 0, 0) }
+    
     odos = df_win['odo'].values
     depths = df_win['depth'].values
     probes = df_win['probe'].values
+    
+    delta_depth = max_depth - min_depth
+    if delta_depth <= 0: delta_depth = 1 # Proteção
+    
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
-    y_coords = ((depths - 53) / 126.0 * height).astype(int)
+    # Mapeamento dinâmico para usar a altura total da imagem de acordo com o limite anatômico
+    y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
+    
     size = 6
     base_triangle = np.array([[0, -size], [-size, size], [size, size]], dtype=np.int32)
     for x, y, p in zip(x_coords, y_coords, probes):
@@ -155,10 +167,9 @@ def gerar_zip_dataset():
         for item in st.session_state.img_gallery:
             if 'img_clean' not in item: continue
             
-            local = item.get('local', 'Alma') # Proteção para dados antigos
+            local = item.get('local', 'Alma') 
             nome_base = f"{item['lado']}_{item['odo_ref']}"
             
-            # Salva na pasta do respectivo modelo/região (ex: Alma/images/Trilho_Esq_100.jpg)
             _, buffer_img = cv2.imencode(".jpg", item['img_clean'])
             zip_file.writestr(f"{local}/images/{nome_base}.jpg", buffer_img.tobytes())
             
@@ -172,7 +183,7 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# 3. INTERFACE DE UPLOAD E VALIDAÇÃO GERAL
+# 3. INTERFACE DE UPLOAD ÚNICO DE CSVS GLOBAIS
 # =====================================================================
 col_upload, col_botoes = st.columns([3, 1])
 
@@ -203,7 +214,7 @@ with col_upload:
                 break
                 
         if arquivos_validos:
-            st.success(f"✅ {len(files)} arquivo(s) validado(s) e prontos para geração das imagens e análise!")
+            st.success(f"✅ {len(files)} arquivo(s) validados! Os ecos serão fisicamente separados por profundidade (Boleto, Alma, Patim) para análise.")
             arquivos_prontos = True
 
 with col_botoes:
@@ -225,51 +236,69 @@ with col_botoes:
         st.rerun()
 
 # =====================================================================
-# 4. PROCESSAMENTO EM LOTE (ENGINE MULTI-MODELO PARALELO)
+# 4. PROCESSAMENTO E SEPARAÇÃO DE IMAGENS POR PROFUNDIDADE (DEPTH)
 # =====================================================================
 if btn_run and arquivos_prontos:
     st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0}
     st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0}
     
-    # 4.1 Carrega os modelos ativos na pasta 'modelo'
     modelos_ativos = {}
     for local_nome, pt_file in CONFIG_MODELOS.items():
         m = load_ov_model(pt_file)
-        if m: 
-            modelos_ativos[local_nome] = m
+        if m: modelos_ativos[local_nome] = m
             
     if not modelos_ativos:
         st.error("Nenhum modelo (.pt) encontrado na pasta 'modelo'. Adicione pelo menos um para realizar a inferência.")
         st.stop()
     
-    progress_bar = st.progress(0.0, text="Lendo e gerando representação B-scan dos arquivos CSV...")
+    progress_bar = st.progress(0.0, text="Concatenando arquivos e aplicando limpeza de ruídos...")
     
-    df_esq_raw, df_dir_raw = ler_e_preparar_dados(files)
-    df_esq = remover_pontos_isolados(df_esq_raw)
-    df_dir = remover_pontos_isolados(df_dir_raw)
+    # Prepara o Dataset Global (Trilho Inteiro)
+    for f in files: f.seek(0)
+    df_raw = pd.concat([pd.read_csv(f) for f in files]).sort_values(by='odo')
+    df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
+    df_raw = df_raw[df_raw['level'] > 450]
+    df_raw = remover_pontos_isolados(df_raw)
     
     found = []
     gallery = []
-    lados = [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
-    total_steps = sum([len(range(int(df['odo'].min()), int(df['odo'].max()), 2400)) for _, df in lados if not df.empty])
     
+    total_steps = len(modelos_ativos) * len(range(int(df_raw['odo'].min()), int(df_raw['odo'].max()), 2400))
     passo_atual = 0
-    for lado_nome, df_side in lados:
-        if df_side.empty: continue
-        for start in range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400):
-            passo_atual += 1
-            progress_bar.progress(min(0.05 + (0.95 * passo_atual / max(1, total_steps)), 1.0), text=f"Aplicando Inteligência ({lado_nome}): ODO {start}mm...")
+
+    # Para cada modelo, fatia a profundidade exata (Depth) da região
+    for local_nome, model in modelos_ativos.items():
+        min_depth, max_depth = LIMITES_PROFUNDIDADE.get(local_nome, (0, 223))
+        delta_depth = max_depth - min_depth if (max_depth - min_depth) > 0 else 1
+        
+        # Filtra os dados globais APENAS pela profundidade anatômica da região atual
+        df_local = df_raw[(df_raw['depth'] >= min_depth) & (df_raw['depth'] <= max_depth)]
+        
+        if df_local.empty:
+            continue
+
+        # Separa Lado Esquerdo e Direito pelas sondas
+        df_esq = df_local[df_local['probe'].isin(SONDAS_ESQUERDA)]
+        df_dir = df_local[df_local['probe'].isin(SONDAS_DIREITA)]
+        
+        lados = [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
+        
+        for lado_nome, df_side in lados:
+            if df_side.empty: continue
             
-            end = start + 2400
-            df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
-            
-            if len(df_win) > 5:
-                # Gera a imagem base UMA ÚNICA VEZ
-                img_base = generate_bscan_buffer(df_win, start, end)
+            for start in range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400):
+                passo_atual += 1
+                if total_steps > 0:
+                    progress_bar.progress(min(0.05 + (0.95 * passo_atual / total_steps), 1.0), text=f"Analisando {local_nome} ({lado_nome}): ODO {start}mm...")
                 
-                # Passa a mesma imagem para cada modelo ativo isoladamente
-                for local_nome, model in modelos_ativos.items():
+                end = start + 2400
+                df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
+                
+                # Gera B-Scan apenas com os pontos de profundidade deste local específico
+                if len(df_win) > 5:
+                    img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
+                    
                     results = model.predict(img_clean, verbose=False, conf=0.5)
                     
                     if len(results[0].boxes) > 0:
@@ -297,7 +326,13 @@ if btn_run and arquivos_prontos:
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
                                 
+                                # Cálculos de profundidade ajustados ao limite dinâmico da região
                                 px1, px2, py1, py2 = x1/w, x2/w, y1/h, y2/h
+                                
+                                center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
+                                center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
+                                comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(delta_depth * py2) - int(delta_depth * py1))**2))
+                                
                                 found.append({
                                     'ID_Global': len(found), 
                                     'ID_Img': f"#{local_id}", 
@@ -305,55 +340,52 @@ if btn_run and arquivos_prontos:
                                     'Lado': lado_nome, 
                                     'Classe': d['cls_nome'], 
                                     'ODO_Ref': start,
-                                    'Coordenada ODO(mm)': int((start+int(2400*px1)+start+int(2400*px2))/2),
-                                    'Coordenada Depth(mm)': int((53+int(126*py1)+53+int(126*py2))/2),
-                                    'Comprimento(mm)': int(np.sqrt((int(2400*px2)-int(2400*px1))**2 + (int(126*py2)-int(126*py1))**2)),
+                                    'Coordenada ODO(mm)': int(center_x_mm),
+                                    'Coordenada Depth(mm)': int(center_y_mm),
+                                    'Comprimento(mm)': comprimento,
                                     'Confiança': f"{d['conf']:.2%}", 
                                     'Aprovado': True,
                                     'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w:.6f} {((y1+y2)/2)/h:.6f} {(x2-x1)/w:.6f} {(y2-y1)/h:.6f}"
                                 })
                             gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
     
-    progress_bar.progress(1.0, text=f"✅ Inferência concluída pelos modelos {', '.join(modelos_ativos.keys())}!")
+    progress_bar.progress(1.0, text="✅ Processamento concluído em todas as fatias de profundidade!")
     
     if found:
         st.session_state.deteccoes = found
         st.session_state.img_gallery = gallery
         st.rerun()
     else:
-        st.info("A inferência foi processada, mas a rede neural não encontrou defeitos em nenhum modelo ativo.")
+        st.info("A inferência foi processada com sucesso, mas a rede neural não encontrou nenhum defeito nas imagens geradas.")
 
 # =====================================================================
-# 5. DISPLAY DE RESULTADOS E NAVEGAÇÃO
+# 5. DISPLAY DE RESULTADOS E NAVEGAÇÃO UI
 # =====================================================================
-if st.session_state.deteccoes:
+if st.session_state.deteccoes or st.session_state.img_gallery:
     st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
     
-    df_raw = pd.DataFrame(st.session_state.deteccoes)
+    df_raw = pd.DataFrame(st.session_state.deteccoes) if st.session_state.deteccoes else pd.DataFrame(columns=['Local', 'Aprovado', 'ID_Global', 'ID_Img'])
     
-    # --- PROTEÇÃO CONTRA CACHE ANTIGO ---
-    if 'Local' not in df_raw.columns:
-        df_raw['Local'] = "Alma" # Atribui Alma para dados velhos da memória
-    if 'Aprovado' not in df_raw.columns:
+    if not df_raw.empty and 'Local' not in df_raw.columns:
+        df_raw['Local'] = "Alma" 
+    if not df_raw.empty and 'Aprovado' not in df_raw.columns:
         df_raw['Aprovado'] = True
-    if 'ID_Global' not in df_raw.columns:
+    if not df_raw.empty and 'ID_Global' not in df_raw.columns:
         df_raw['ID_Global'] = df_raw.index
-    if 'ID_Img' not in df_raw.columns:
-        df_raw['ID_Img'] = "#-"
         
-    locais_disponiveis = list(df_raw['Local'].unique())
+    st.markdown("<h4 style='color: #FFC600; text-align: center;'>Alternar Visualização e Auditoria dos Modelos:</h4>", unsafe_allow_html=True)
     
-    st.markdown("<h4 style='color: #FFC600;'>Visualizar Resultados do Modelo:</h4>", unsafe_allow_html=True)
-    local_selecionado = st.radio("Selecione:", locais_disponiveis, horizontal=True, label_visibility="collapsed")
+    locais_fixos = ["Alma", "Boleto", "Patim"]
+    local_selecionado = st.radio("Selecione:", locais_fixos, horizontal=True, label_visibility="collapsed")
     
-    df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy()
-    galeria_local_atual = [item for item in st.session_state.img_gallery if item.get('local', 'Alma') == local_selecionado]
+    df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy() if not df_raw.empty else pd.DataFrame()
+    galeria_local_atual = [item for item in st.session_state.img_gallery if item.get('local') == local_selecionado]
     
     if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
     if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
     
     colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
-    df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore')
+    df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore') if not df_local_atual.empty else pd.DataFrame()
     
     aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
     
@@ -370,7 +402,7 @@ if st.session_state.deteccoes:
                 contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
                 st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
             else:
-                st.info("Nenhum defeito aprovado neste local.")
+                st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
             
         with col_filtros:
             st.markdown("##### 🔍 Refinar Busca")
@@ -384,27 +416,29 @@ if st.session_state.deteccoes:
                 
         if not df_aprovados_local.empty:
             df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
-            
             st.markdown("<br>", unsafe_allow_html=True)
-            col_down, col_vazia2 = st.columns([1, 3])
+            st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
             
-            with col_down:
+        # BOTÃO GLOBAL
+        st.markdown("<hr>", unsafe_allow_html=True)
+        col_down, col_vazia2 = st.columns([1, 2])
+        with col_down:
+            if not df_raw.empty:
                 df_aprovados_global = df_raw[df_raw['Aprovado'] == True].drop(columns=['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox'], errors='ignore')
                 
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_aprovados_global.to_excel(writer, index=False, sheet_name='Defeitos_US')
+                    df_aprovados_global.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
                 excel_data = output.getvalue()
                 
                 st.download_button(
-                    label="📥 Baixar Relatório Completo (Todos os Modelos)", 
+                    label="📥 Baixar Relatório Completo (Todos os Modelos Unificados)", 
                     data=excel_data, 
                     file_name=f"relatorio_us_completo_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True
+                    use_container_width=True,
+                    type="primary"
                 )
-                
-            st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
             
     # -----------------------------------------------------------------
     # ABA 2: AUDITORIA E EXPORTAÇÃO
@@ -443,28 +477,31 @@ if st.session_state.deteccoes:
                 mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado']) & (df_raw['Local'] == local_selecionado)
                 df_imagem_atual = df_raw[mask].copy()
                 
-                edited_df = st.data_editor(
-                    df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
-                    column_config={
-                        "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
-                        "ID_Global": None, 
-                        "ID_Img": st.column_config.TextColumn("Ref na Imagem")
-                    },
-                    disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)'], 
-                    hide_index=True,
-                    use_container_width=True,
-                    key=f"editor_img_{local_selecionado}_{img_idx}" 
-                )
-                
-                for _, row in edited_df.iterrows():
-                    g_id = int(row['ID_Global'])
-                    if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
-                        st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
-                        st.rerun() 
+                if not df_imagem_atual.empty:
+                    edited_df = st.data_editor(
+                        df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
+                        column_config={
+                            "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
+                            "ID_Global": None, 
+                            "ID_Img": st.column_config.TextColumn("Ref")
+                        },
+                        disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)'], 
+                        hide_index=True,
+                        use_container_width=True,
+                        key=f"editor_img_{local_selecionado}_{img_idx}" 
+                    )
+                    
+                    for _, row in edited_df.iterrows():
+                        g_id = int(row['ID_Global'])
+                        if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
+                            st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
+                            st.rerun() 
+                else:
+                    st.info("Esta imagem não possui detecções ativas. Serve como negative mining no retreinamento.")
             
             st.markdown("<br><hr>", unsafe_allow_html=True)
             st.markdown("#### 📦 Exportar Dataset Estruturado para Retreinamento (YOLOv8)")
-            st.markdown("Baixe um único ZIP contendo as imagens limpas e anotações corrigidas, automaticamente separadas nas pastas físicas de cada local (Alma, Boleto, Patim).")
+            st.markdown("Baixe um único ZIP contendo todas as imagens e anotações validadas, organizadas automaticamente nas pastas de cada local (Alma, Boleto, Patim).")
             
             if 'img_clean' in st.session_state.img_gallery[0]:
                 st.download_button(
@@ -475,7 +512,10 @@ if st.session_state.deteccoes:
                     use_container_width=False
                 )
         else:
-            st.info("Nenhuma detecção para auditar nesta visualização.")
+            if local_selecionado == "Patim":
+                st.info("⚠️ O modelo do Patim não está carregado ou os arquivos não possuem dados dessa região.")
+            else:
+                st.info(f"Nenhuma imagem correspondente a {local_selecionado} para auditar.")
 
     # -----------------------------------------------------------------
     # ABA 3: GALERIA DE IMAGENS
@@ -484,7 +524,7 @@ if st.session_state.deteccoes:
         st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão para tela cheia.")
         
         itens_por_pagina = 20
-        total_paginas = max(1, (total_imagens_det - 1) // itens_por_pagina + 1)
+        total_paginas = max(1, (total_imagens_det - 1) // itens_por_pagina + 1) if total_imagens_det > 0 else 1
         
         if st.session_state.page[local_selecionado] >= total_paginas:
             st.session_state.page[local_selecionado] = 0
@@ -505,13 +545,13 @@ if st.session_state.deteccoes:
             col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
             with col_pg_esq:
                 if st.session_state.page[local_selecionado] > 0:
-                    if st.button("⬅️ Anterior", use_container_width=True, key="pg_prev"):
+                    if st.button("⬅️ Anterior", use_container_width=True, key="pg_gal_prev"):
                         st.session_state.page[local_selecionado] -= 1
                         st.rerun()
             with col_pg_centro:
                 st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
             with col_pg_dir:
                 if st.session_state.page[local_selecionado] < total_paginas - 1:
-                    if st.button("Próxima ➡️", use_container_width=True, key="pg_next"):
+                    if st.button("Próxima ➡️", use_container_width=True, key="pg_gal_next"):
                         st.session_state.page[local_selecionado] += 1
                         st.rerun()
