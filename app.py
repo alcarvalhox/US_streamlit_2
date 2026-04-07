@@ -289,9 +289,7 @@ if btn_run and arquivos_prontos:
                     img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
                     
-                    # ⚠️ CORREÇÃO DA TALA ISOLADA: Redução de conf=0.50 para conf=0.25 (Padrão YOLO) 
-                    # para permitir a captura de classes maiores e mais dispersas.
-                    results = model.predict(img_clean, verbose=False, conf=0.25)
+                    results = model.predict(img_clean, verbose=False, conf=0.15)
                     
                     if len(results[0].boxes) > 0:
                         raw_dets = []
@@ -306,17 +304,31 @@ if btn_run and arquivos_prontos:
                             for f in final_dets:
                                 if d['cls_id'] == f['cls_id']:
                                     bx2 = f['box']
-                                    xl, yt, xr, yb = max(bx1[0], bx2[0]), max(bx1[1], bx2[1]), min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
+                                    
+                                    # ⚠️ LÓGICA DE FUSÃO POR PROXIMIDADE (VIRTUAL EXPANSION)
+                                    # Se a classe for Furo (ou furo), expandimos a caixa em 15 pixels (~48mm reais).
+                                    # Assim, se a rede dividir um furo em dois pedaços próximos, eles serão unificados.
+                                    margem = 15 if d['cls_nome'].lower() == 'furo' else 0
+                                    
+                                    xl = max(bx1[0] - margem, bx2[0] - margem)
+                                    yt = max(bx1[1] - margem, bx2[1] - margem)
+                                    xr = min(bx1[2] + margem, bx2[2] + margem)
+                                    yb = min(bx1[3] + margem, bx2[3] + margem)
+                                    
                                     if xr > xl and yb > yt:
-                                        area_inter = (xr-xl)*(yb-yt)
-                                        area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
-                                        
-                                        # ⚠️ CORREÇÃO DA TALA ISOLADA: Afrouxamento do NMS de 10% para 40% de sobreposição
-                                        # Evita que a caixa de uma Tala "engula" as bordas de outra caixa fragmentada
-                                        limite_nms = 0.40 if d['cls_nome'] == 'Tala_Isolada' else 0.10
-                                        
-                                        if (area_inter / area_min) > limite_nms:
-                                            duplicado = True; break
+                                        if d['cls_nome'].lower() == 'furo':
+                                            # Se as caixas expandidas se tocarem, deleta a duplicidade do Furo
+                                            duplicado = True
+                                            break
+                                        else:
+                                            # Para outras classes, aplica NMS matemático padrão
+                                            area_inter = (xr-xl)*(yb-yt)
+                                            area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
+                                            limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.15
+                                            
+                                            if (area_inter / area_min) > limite_nms:
+                                                duplicado = True
+                                                break
                             if not duplicado: final_dets.append(d)
 
                         if final_dets:
@@ -325,7 +337,7 @@ if btn_run and arquivos_prontos:
                             for local_id, d in enumerate(final_dets, 1):
                                 x1, y1, x2, y2 = d['box']
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
-                                cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
+                                cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
                                 px1, px2, py1, py2 = x1/w, x2/w, y1/h, y2/h
                                 center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
@@ -375,7 +387,7 @@ if st.session_state.deteccoes or st.session_state.img_gallery:
     local_selecionado = st.radio("Selecione:", locais_fixos, horizontal=True, label_visibility="collapsed")
     
     # =====================================================================
-    # BLOCO: 🌐 VISÃO GLOBAL (Apenas Tabela de Dados e Relatório Geral)
+    # BLOCO: 🌐 VISÃO GLOBAL
     # =====================================================================
     if local_selecionado == "🌐 Visão Global":
         aba_dados = st.tabs(["📊 Tabelas e Relatório Global"])[0]
@@ -477,7 +489,6 @@ if st.session_state.deteccoes or st.session_state.img_gallery:
                 df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
                 st.markdown("<br>", unsafe_allow_html=True)
                 st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
-                # Nota: Botão de download removido daqui conforme solicitado. Acesse pela Visão Global.
 
         with aba_auditoria:
             total_imagens_det = len(galeria_local_atual)
