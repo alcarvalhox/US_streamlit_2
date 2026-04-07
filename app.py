@@ -4,7 +4,7 @@ import os
 import base64
 
 # =====================================================================
-# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
+# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS E CONFIGURAÇÃO
 # =====================================================================
 def install_dependencies():
     if os.path.exists("requirements.txt"):
@@ -28,6 +28,12 @@ from ultralytics import YOLO
 from datetime import datetime
 from scipy.spatial import cKDTree
 
+CONFIG_MODELOS = {
+    "Alma": "best_alma_1.pt",
+    "Boleto": "best_boleto_1.pt",
+    "Patim": "best_patim_1.pt"
+}
+
 # =====================================================================
 # 1. CONFIGURAÇÕES, TÍTULO E ESTILO
 # =====================================================================
@@ -50,6 +56,10 @@ h1, h2, h3, p, label, .stMarkdown, .stText { color: white !important; }
 }
 .stButton>button:hover, [data-testid="stDownloadButton"] button:hover { background-color: #e6b300; color: white !important; }
 .stDataFrame { background-color: white; border-radius: 5px; }
+div.row-widget.stRadio > div{flex-direction:row;}
+div.row-widget.stRadio > div > label{
+    background-color: #FFC600; padding: 10px 20px; border-radius: 5px; color:#003865 !important; font-weight: bold; margin-right: 10px; cursor: pointer;
+}
 </style>
 """
 st.markdown(cores_mrs, unsafe_allow_html=True)
@@ -80,13 +90,11 @@ with col_veiculo:
 st.markdown("<hr style='margin-top: -5px; margin-bottom: 15px;'>", unsafe_allow_html=True)
 
 MODEL_DIR = "modelo"
-MODEL_PT = os.path.join(MODEL_DIR, "best_alma_1.pt")
-MODEL_OV = os.path.join(MODEL_DIR, "best_alma_1_openvino_model")
 
 if 'deteccoes' not in st.session_state: st.session_state.deteccoes = []
 if 'img_gallery' not in st.session_state: st.session_state.img_gallery = []
-if 'page' not in st.session_state: st.session_state.page = 0
-if 'audit_idx' not in st.session_state: st.session_state.audit_idx = 0 
+if 'page' not in st.session_state: st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0}
+if 'audit_idx' not in st.session_state: st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0} 
 if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0 
 
 # =====================================================================
@@ -109,18 +117,20 @@ def remover_pontos_isolados(df, raio=10):
     return df[contagem > 1].copy()
 
 @st.cache_resource
-def load_ov_model():
+def load_ov_model(nome_pt):
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
-    if not os.path.exists(MODEL_OV):
-        if os.path.exists(MODEL_PT):
-            with st.status("Convertendo pesos para OpenVINO local...") as s:
-                model = YOLO(MODEL_PT)
+    path_pt = os.path.join(MODEL_DIR, nome_pt)
+    path_ov = os.path.join(MODEL_DIR, nome_pt.replace(".pt", "_openvino_model"))
+    
+    if not os.path.exists(path_ov):
+        if os.path.exists(path_pt):
+            with st.status(f"Convertendo pesos do {nome_pt} para OpenVINO local...") as s:
+                model = YOLO(path_pt)
                 model.export(format="openvino", half=True)
                 s.update(label="Otimização Concluída!", state="complete")
         else:
-            st.error(f"Erro: Coloque o arquivo {MODEL_PT} na pasta /{MODEL_DIR}")
-            return None
-    return YOLO(MODEL_OV, task='detect')
+            return None 
+    return YOLO(path_ov, task='detect')
 
 def generate_bscan_buffer(df_win, start, end):
     width, height = 1500, 500
@@ -139,45 +149,43 @@ def generate_bscan_buffer(df_win, start, end):
     return img
 
 def gerar_zip_dataset():
-    """Gera um arquivo ZIP com as pastas images/ e labels/ no padrão YOLO."""
+    """Gera um arquivo ZIP exportando a estrutura de pastas reais para cada local."""
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for item in st.session_state.img_gallery:
-            # Pula se a imagem original limpa não estiver disponível (fallback de segurança)
             if 'img_clean' not in item: continue
             
+            local = item['local'] # Alma, Boleto ou Patim
             nome_base = f"{item['lado']}_{item['odo_ref']}"
             
-            # 1. Salvar Imagem Limpa
+            # Salva na pasta do respectivo modelo/região (ex: Alma/images/Trilho_Esq_100.jpg)
             _, buffer_img = cv2.imencode(".jpg", item['img_clean'])
-            zip_file.writestr(f"images/{nome_base}.jpg", buffer_img.tobytes())
+            zip_file.writestr(f"{local}/images/{nome_base}.jpg", buffer_img.tobytes())
             
-            # 2. Salvar Labels Aprovadas
             linhas_yolo = []
             for det in st.session_state.deteccoes:
-                if det['ODO_Ref'] == item['odo_ref'] and det['Lado'] == item['lado'] and det['Aprovado']:
+                if det['ODO_Ref'] == item['odo_ref'] and det['Lado'] == item['lado'] and det['Local'] == local and det['Aprovado']:
                     linhas_yolo.append(det['yolo_bbox'])
             
-            # Cria o arquivo .txt (se vazio, serve para Negative Mining)
-            conteudo_txt = "\n".join(linhas_yolo)
-            zip_file.writestr(f"labels/{nome_base}.txt", conteudo_txt)
+            zip_file.writestr(f"{local}/labels/{nome_base}.txt", "\n".join(linhas_yolo))
             
     return zip_buffer.getvalue()
 
 # =====================================================================
-# 3. INTERFACE, CONTROLES E VALIDAÇÃO DE ARQUIVOS
+# 3. INTERFACE DE UPLOAD E VALIDAÇÃO GERAL
 # =====================================================================
 col_upload, col_botoes = st.columns([3, 1])
 
 with col_upload:
     files = st.file_uploader(
-        "Faça o Upload dos arquivos CSV", 
+        "Faça o Upload dos arquivos CSV de inspeção brutos", 
         type=['csv'], 
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.uploader_key}" 
     )
     
     arquivos_prontos = False
+    
     if files:
         colunas_esperadas = {'odo', 'frame', 'probe', 'depth', 'sample', 'level'}
         arquivos_validos = True
@@ -185,24 +193,22 @@ with col_upload:
         for f in files:
             try:
                 df_header = pd.read_csv(f, nrows=0)
-                colunas_atuais = set(df_header.columns)
-                
-                if not colunas_esperadas.issubset(colunas_atuais):
-                    st.error(f"⚠️ **Erro no arquivo:** `{f.name}`\n\nO formato está fora do padrão aceito. O arquivo deve conter obrigatoriamente as colunas: `odo`, `frame`, `probe`, `depth`, `sample`, `level`.")
+                if not colunas_esperadas.issubset(set(df_header.columns)):
+                    st.error(f"⚠️ **Erro no arquivo:** `{f.name}` - Formato fora do padrão.")
                     arquivos_validos = False
                     break 
-            except Exception as e:
-                st.error(f"⚠️ **Erro de Leitura:** Não foi possível ler o arquivo `{f.name}`. Verifique se ele não está corrompido.")
+            except:
+                st.error(f"⚠️ **Erro de Leitura:** Não foi possível ler o arquivo `{f.name}`.")
                 arquivos_validos = False
                 break
                 
         if arquivos_validos:
-            st.success(f"✅ {len(files)} arquivo(s) validado(s) e dentro do padrão!")
+            st.success(f"✅ {len(files)} arquivo(s) validado(s) e prontos para geração das imagens e análise!")
             arquivos_prontos = True
 
 with col_botoes:
     st.markdown("<br>", unsafe_allow_html=True)
-    btn_run = st.button("🚀 Iniciar Inferência", type="primary", use_container_width=True, disabled=not arquivos_prontos)
+    btn_run = st.button("🚀 Iniciar Inferências", type="primary", use_container_width=True, disabled=not arquivos_prontos)
     
     if st.button("🧹 Limpar Arquivos", use_container_width=True):
         st.session_state.uploader_key += 1 
@@ -211,168 +217,132 @@ with col_botoes:
     if st.button("🗑️ Resetar Sistema", use_container_width=True):
         st.session_state.deteccoes = []
         st.session_state.img_gallery = []
-        st.session_state.page = 0 
-        st.session_state.audit_idx = 0 
+        st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0}
+        st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0}
         st.session_state.uploader_key += 1 
         st.cache_resource.clear()
         st.cache_data.clear() 
         st.rerun()
 
 # =====================================================================
-# 4. PROCESSAMENTO E INFERÊNCIA COM EXPORTAÇÃO YOLO
+# 4. PROCESSAMENTO EM LOTE (ENGINE MULTI-MODELO PARALELO)
 # =====================================================================
 if btn_run and arquivos_prontos:
-    st.session_state.page = 0 
-    st.session_state.audit_idx = 0 
-    model = load_ov_model()
-    if model:
-        progress_bar = st.progress(0.0, text="Lendo e preparando arquivos CSV da memória cache...")
-        df_esq_raw, df_dir_raw = ler_e_preparar_dados(files)
-        
-        progress_bar.progress(0.05, text="Removendo ruídos e pontos isolados...")
-        df_esq = remover_pontos_isolados(df_esq_raw)
-        df_dir = remover_pontos_isolados(df_dir_raw)
-        
-        found = []
-        gallery = []
-        lados = [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
-        total_steps = sum([len(range(int(df['odo'].min()), int(df['odo'].max()), 2400)) for _, df in lados if not df.empty])
-        
-        passo_atual = 0
-
-        for lado_nome, df_side in lados:
-            if df_side.empty: continue
-            steps = range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400)
-            for start in steps:
-                passo_atual += 1
-                progress_bar.progress(min(0.05 + (0.95 * passo_atual / max(1, total_steps)), 1.0), text=f"Analisando {lado_nome}: ODO {start}mm...")
-
-                end = start + 2400
-                df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
+    st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0}
+    st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0}
+    
+    # 4.1 Carrega os modelos ativos na pasta 'modelo'
+    modelos_ativos = {}
+    for local_nome, pt_file in CONFIG_MODELOS.items():
+        m = load_ov_model(pt_file)
+        if m: 
+            modelos_ativos[local_nome] = m
+            
+    if not modelos_ativos:
+        st.error("Nenhum modelo (.pt) encontrado na pasta 'modelo'. Adicione pelo menos um para realizar a inferência.")
+        st.stop()
+    
+    progress_bar = st.progress(0.0, text="Lendo e gerando representação B-scan dos arquivos CSV...")
+    
+    df_esq_raw, df_dir_raw = ler_e_preparar_dados(files)
+    df_esq = remover_pontos_isolados(df_esq_raw)
+    df_dir = remover_pontos_isolados(df_dir_raw)
+    
+    found = []
+    gallery = []
+    lados = [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
+    total_steps = sum([len(range(int(df['odo'].min()), int(df['odo'].max()), 2400)) for _, df in lados if not df.empty])
+    
+    passo_atual = 0
+    for lado_nome, df_side in lados:
+        if df_side.empty: continue
+        for start in range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400):
+            passo_atual += 1
+            progress_bar.progress(min(0.05 + (0.95 * passo_atual / max(1, total_steps)), 1.0), text=f"Aplicando Inteligência ({lado_nome}): ODO {start}mm...")
+            
+            end = start + 2400
+            df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
+            
+            if len(df_win) > 5:
+                # Gera a imagem base UMA ÚNICA VEZ
+                img_base = generate_bscan_buffer(df_win, start, end)
                 
-                if len(df_win) > 5:
-                    img = generate_bscan_buffer(df_win, start, end)
-                    img_clean = img.copy() # Salva a imagem original sem anotações para exportação
-                    
-                    results = model.predict(img, verbose=False, conf=0.5)
+                # Passa a mesma imagem para cada modelo ativo isoladamente
+                for local_nome, model in modelos_ativos.items():
+                    img_clean = img_base.copy()
+                    results = model.predict(img_clean, verbose=False, conf=0.5)
                     
                     if len(results[0].boxes) > 0:
                         raw_dets = []
                         for box in results[0].boxes:
-                            bx = box.xyxy[0].cpu().numpy().astype(int)
-                            raw_dets.append({
-                                'box': bx,
-                                'conf': float(box.conf),
-                                'cls_nome': model.names[int(box.cls)],
-                                'cls_id': int(box.cls) # Guardamos o ID numérico da classe para o YOLO
-                            })
+                            raw_dets.append({'box': box.xyxy[0].cpu().numpy().astype(int), 'conf': float(box.conf), 'cls_nome': model.names[int(box.cls)], 'cls_id': int(box.cls)})
                         
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
-
                         final_dets = []
                         for d in raw_dets:
-                            bx1 = d['box']
-                            duplicado = False
-
+                            bx1, duplicado = d['box'], False
                             for f in final_dets:
                                 bx2 = f['box']
-                                x_left, y_top = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
-                                x_right, y_bottom = min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
-
-                                if x_right > x_left and y_bottom > y_top:
-                                    inter_area = (x_right - x_left) * (y_bottom - y_top)
-                                    area1 = (bx1[2] - bx1[0]) * (bx1[3] - bx1[1])
-                                    area2 = (bx2[2] - bx2[0]) * (bx2[3] - bx2[1])
-                                    min_area = min(area1, area2)
-                                    overlap_ratio = inter_area / min_area if min_area > 0 else 0
-                                    
-                                    if overlap_ratio > 0.10:
-                                        duplicado = True
-                                        break
-
-                            if not duplicado:
-                                final_dets.append(d)
+                                xl, yt, xr, yb = max(bx1[0], bx2[0]), max(bx1[1], bx2[1]), min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
+                                if xr > xl and yb > yt:
+                                    if ((xr-xl)*(yb-yt) / min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))) > 0.10:
+                                        duplicado = True; break
+                            if not duplicado: final_dets.append(d)
 
                         if final_dets:
-                            img_draw = img.copy()
-                            h, w, _ = img.shape
-                            local_id = 1
-                            
-                            for d in final_dets:
+                            img_draw = img_clean.copy()
+                            h, w, _ = img_draw.shape
+                            for local_id, d in enumerate(final_dets, 1):
                                 x1, y1, x2, y2 = d['box']
-                                classe_nome = d['cls_nome']
-                                conf_val = d['conf']
-                                cls_id = d['cls_id']
+                                cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
+                                cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2)
                                 
-                                # --- Cálculos Relativos (Normalizados) para exportação YOLO ---
-                                cx_norm = ((x1 + x2) / 2.0) / float(w)
-                                cy_norm = ((y1 + y2) / 2.0) / float(h)
-                                w_norm = float(x2 - x1) / float(w)
-                                h_norm = float(y2 - y1) / float(h)
-                                string_yolo = f"{cls_id} {cx_norm:.6f} {cy_norm:.6f} {w_norm:.6f} {h_norm:.6f}"
-                                
-                                # Desenho visual
-                                cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                                texto = f"#{local_id} {classe_nome}"
-                                (w_txt, h_txt), _ = cv2.getTextSize(texto, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                                cv2.rectangle(img_draw, (x1, y1 - 25), (x1 + w_txt + 5, y1), (0, 0, 255), -1)
-                                cv2.putText(img_draw, texto, (x1 + 2, y1 - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                                
-                                # Cálculos Físicos
-                                px1, px2 = x1/w, x2/w
-                                py1, py2 = y1/h, y2/h
-                                center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
-                                center_y_mm = (53 + int(126 * py1) + 53 + int(126 * py2)) / 2
-                                comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(126 * py2) - int(126 * py1))**2))
-                                
+                                px1, px2, py1, py2 = x1/w, x2/w, y1/h, y2/h
                                 found.append({
-                                    'ID_Global': len(found),
-                                    'ID_Img': f"#{local_id}",
-                                    'Lado': lado_nome,
-                                    'Classe': classe_nome,
+                                    'ID_Global': len(found), 
+                                    'ID_Img': f"#{local_id}", 
+                                    'Local': local_nome, 
+                                    'Lado': lado_nome, 
+                                    'Classe': d['cls_nome'], 
                                     'ODO_Ref': start,
-                                    'Coordenada ODO(mm)': int(center_x_mm),
-                                    'Coordenada Depth(mm)': int(center_y_mm),
-                                    'Comprimento(mm)': comprimento,
-                                    'Confiança': f"{conf_val:.2%}",
+                                    'Coordenada ODO(mm)': int((start+int(2400*px1)+start+int(2400*px2))/2),
+                                    'Coordenada Depth(mm)': int((53+int(126*py1)+53+int(126*py2))/2),
+                                    'Comprimento(mm)': int(np.sqrt((int(2400*px2)-int(2400*px1))**2 + (int(126*py2)-int(126*py1))**2)),
+                                    'Confiança': f"{d['conf']:.2%}", 
                                     'Aprovado': True,
-                                    'yolo_bbox': string_yolo # Guardado invisível na memória para exportação
+                                    'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w:.6f} {((y1+y2)/2)/h:.6f} {(x2-x1)/w:.6f} {(y2-y1)/h:.6f}"
                                 })
-                                local_id += 1
-                                
-                            gallery.append({
-                                "img": img_draw, 
-                                "img_clean": img_clean, # Salva a original sem desenhos
-                                "label": f"{lado_nome} @ {start}", 
-                                "odo_ref": start, 
-                                "lado": lado_nome
-                            })
-        
-        progress_bar.progress(1.0, text=f"✅ Inferência concluída! {len(found)} defeitos encontrados.")
+                            gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
+    
+    progress_bar.progress(1.0, text=f"✅ Inferência concluída pelos modelos {', '.join(modelos_ativos.keys())}!")
+    
+    if found:
         st.session_state.deteccoes = found
         st.session_state.img_gallery = gallery
-        st.rerun() 
+        st.rerun()
+    else:
+        st.info("A inferência foi processada, mas a rede neural não encontrou defeitos em nenhum modelo ativo.")
 
 # =====================================================================
-# 5. DISPLAY DE RESULTADOS (3 ABAS: TABELA, AUDITORIA, GALERIA)
+# 5. DISPLAY DE RESULTADOS E NAVEGAÇÃO
 # =====================================================================
 if st.session_state.deteccoes:
     st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
     
     df_raw = pd.DataFrame(st.session_state.deteccoes)
+    locais_disponiveis = list(df_raw['Local'].unique())
     
-    if 'Aprovado' not in df_raw.columns:
-        df_raw['Aprovado'] = True
-    if 'ID_Global' not in df_raw.columns:
-        df_raw['ID_Global'] = df_raw.index
-    if 'ID_Img' not in df_raw.columns:
-        df_raw['ID_Img'] = "#-"
+    st.markdown("<h4 style='color: #FFC600;'>Visualizar Resultados do Modelo:</h4>", unsafe_allow_html=True)
+    local_selecionado = st.radio("Selecione:", locais_disponiveis, horizontal=True, label_visibility="collapsed")
     
-    # Prepara visualização (esconde colunas técnicas)
-    colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img']
-    if 'yolo_bbox' in df_raw.columns: colunas_esconder.append('yolo_bbox')
+    df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy()
+    galeria_local_atual = [item for item in st.session_state.img_gallery if item['local'] == local_selecionado]
     
-    df_aprovados = df_raw[df_raw['Aprovado'] == True].drop(columns=colunas_esconder)
+    if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
+    if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
+    
+    colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
+    df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore')
     
     aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
     
@@ -383,76 +353,73 @@ if st.session_state.deteccoes:
         col_resumo, col_filtros = st.columns([1, 2])
         
         with col_resumo:
-            st.markdown("##### 📈 Resumo Geral (Aprovados)")
-            if not df_aprovados.empty:
-                contagem_classes = df_aprovados['Classe'].value_counts().reset_index()
+            st.markdown(f"##### 📈 Resumo - {local_selecionado} (Aprovados)")
+            if not df_aprovados_local.empty:
+                contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
                 contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
                 st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
             else:
-                st.info("Nenhum defeito aprovado.")
+                st.info("Nenhum defeito aprovado neste local.")
             
         with col_filtros:
             st.markdown("##### 🔍 Refinar Busca")
             cf1, cf2 = st.columns(2)
             with cf1:
-                classes_disponiveis = df_aprovados['Classe'].unique() if not df_aprovados.empty else []
-                filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disponiveis, default=classes_disponiveis)
+                classes_disp = df_aprovados_local['Classe'].unique() if not df_aprovados_local.empty else []
+                filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disp, default=classes_disp)
             with cf2:
-                lados_disponiveis = df_aprovados['Lado'].unique() if not df_aprovados.empty else []
-                filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disponiveis, default=lados_disponiveis)
+                lados_disp = df_aprovados_local['Lado'].unique() if not df_aprovados_local.empty else []
+                filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disp, default=lados_disp)
                 
-        if not df_aprovados.empty:
-            df_filtrado = df_aprovados[(df_aprovados['Classe'].isin(filtro_classe)) & (df_aprovados['Lado'].isin(filtro_lado))]
+        if not df_aprovados_local.empty:
+            df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
             
             st.markdown("<br>", unsafe_allow_html=True)
             col_down, col_vazia2 = st.columns([1, 3])
+            
             with col_down:
+                df_aprovados_global = df_raw[df_raw['Aprovado'] == True].drop(columns=['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox'], errors='ignore')
+                
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    df_filtrado.to_excel(writer, index=False, sheet_name='Defeitos_US')
+                    df_aprovados_global.to_excel(writer, index=False, sheet_name='Defeitos_US')
                 excel_data = output.getvalue()
                 
                 st.download_button(
-                    label="📥 Baixar Dados Validados", 
+                    label="📥 Baixar Relatório Completo (Todos os Modelos)", 
                     data=excel_data, 
-                    file_name=f"relatorio_us_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
+                    file_name=f"relatorio_us_completo_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True
                 )
                 
-            st.dataframe(df_filtrado, hide_index=True, use_container_width=True)
+            st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
             
     # -----------------------------------------------------------------
     # ABA 2: AUDITORIA E EXPORTAÇÃO
     # -----------------------------------------------------------------
     with aba_auditoria:
-        st.markdown("##### Selecione a imagem para avaliar os defeitos encontrados:")
-        
-        total_imagens_det = len(st.session_state.img_gallery)
+        total_imagens_det = len(galeria_local_atual)
         if total_imagens_det > 0:
             
             col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
             with col_nav_esq:
-                if st.session_state.audit_idx > 0:
-                    if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_audit_prev"):
-                        st.session_state.audit_idx -= 1
+                if st.session_state.audit_idx[local_selecionado] > 0:
+                    if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_prev"):
+                        st.session_state.audit_idx[local_selecionado] -= 1
                         st.rerun()
             with col_nav_centro:
-                st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx + 1} de {total_imagens_det}</h5>", unsafe_allow_html=True)
+                st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx[local_selecionado] + 1} de {total_imagens_det} ({local_selecionado})</h5>", unsafe_allow_html=True)
             with col_nav_dir:
-                if st.session_state.audit_idx < total_imagens_det - 1:
-                    if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_audit_next"):
-                        st.session_state.audit_idx += 1
+                if st.session_state.audit_idx[local_selecionado] < total_imagens_det - 1:
+                    if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_next"):
+                        st.session_state.audit_idx[local_selecionado] += 1
                         st.rerun()
             
-            if st.session_state.audit_idx >= total_imagens_det:
-                st.session_state.audit_idx = 0
-                
-            img_idx = st.session_state.audit_idx
-            img_atual = st.session_state.img_gallery[img_idx]
+            img_idx = st.session_state.audit_idx[local_selecionado]
+            img_atual = galeria_local_atual[img_idx]
             
             st.markdown("<br>", unsafe_allow_html=True) 
-            
             col_esq, col_dir = st.columns([3, 2])
             
             with col_esq:
@@ -461,66 +428,59 @@ if st.session_state.deteccoes:
                 
             with col_dir:
                 st.markdown("#### Validar Detecções")
-                st.markdown("Desmarque a caixa para excluir um Falso Positivo do Relatório Final e do arquivo de Retreinamento.")
                 
-                if 'odo_ref' in img_atual and 'lado' in img_atual:
-                    mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado'])
-                    df_imagem_atual = df_raw[mask].copy()
-                    
-                    # === ATUALIZAÇÃO: INCLUSÃO DA COLUNA DE PROFUNDIDADE NA AUDITORIA ===
-                    edited_df = st.data_editor(
-                        df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
-                        column_config={
-                            "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
-                            "ID_Global": None, 
-                            "ID_Img": st.column_config.TextColumn("Ref na Imagem")
-                        },
-                        disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)'], 
-                        hide_index=True,
-                        use_container_width=True,
-                        key=f"editor_img_{img_idx}" 
-                    )
-                    
-                    for _, row in edited_df.iterrows():
-                        g_id = int(row['ID_Global'])
-                        if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
-                            st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
-                            st.rerun() 
-                else:
-                    st.warning("Detectamos dados antigos de galeria nesta sessão. Clique em 'Resetar Sistema' e faça a inferência novamente para usar a Auditoria.")
+                mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado']) & (df_raw['Local'] == local_selecionado)
+                df_imagem_atual = df_raw[mask].copy()
+                
+                edited_df = st.data_editor(
+                    df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
+                    column_config={
+                        "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
+                        "ID_Global": None, 
+                        "ID_Img": st.column_config.TextColumn("Ref na Imagem")
+                    },
+                    disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)'], 
+                    hide_index=True,
+                    use_container_width=True,
+                    key=f"editor_img_{local_selecionado}_{img_idx}" 
+                )
+                
+                for _, row in edited_df.iterrows():
+                    g_id = int(row['ID_Global'])
+                    if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
+                        st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
+                        st.rerun() 
             
-            # --- SEÇÃO DE EXPORTAÇÃO (ACTIVE LEARNING) ---
             st.markdown("<br><hr>", unsafe_allow_html=True)
-            st.markdown("#### 📦 Exportar Dataset para Retreinamento (YOLOv8)")
-            st.markdown("Gere um pacote `.zip` com as imagens limpas e as anotações corrigidas. Imagens com detecções 'Reprovadas' gerarão anotações vazias, forçando o modelo a aprender através do *Negative Mining*.")
+            st.markdown("#### 📦 Exportar Dataset Estruturado para Retreinamento (YOLOv8)")
+            st.markdown("Baixe um único ZIP contendo as imagens limpas e anotações corrigidas, automaticamente separadas nas pastas físicas de cada local (Alma, Boleto, Patim).")
             
             if 'img_clean' in st.session_state.img_gallery[0]:
                 st.download_button(
-                    label="⬇️ Baixar Dataset ZIP",
+                    label="⬇️ Baixar Dataset Global Estruturado",
                     data=gerar_zip_dataset(),
-                    file_name=f"dataset_retreino_us_{datetime.now().strftime('%d%m%H%M')}.zip",
+                    file_name=f"dataset_multi_retreino_{datetime.now().strftime('%d%m%H%M')}.zip",
                     mime="application/zip",
                     use_container_width=False
                 )
-            else:
-                st.info("Para exportar, faça uma nova inferência (arquivos antigos em memória não possuem as imagens originais limpas).")
-            
         else:
-            st.info("Nenhuma detecção para auditar.")
+            st.info("Nenhuma detecção para auditar nesta visualização.")
 
     # -----------------------------------------------------------------
     # ABA 3: GALERIA DE IMAGENS
     # -----------------------------------------------------------------
     with aba_galeria:
-        st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão no canto superior direito para visualizá-la em tela cheia.")
+        st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão para tela cheia.")
         
         itens_por_pagina = 20
-        total_imagens = len(st.session_state.img_gallery)
-        total_paginas = max(1, (total_imagens - 1) // itens_por_pagina + 1)
+        total_paginas = max(1, (total_imagens_det - 1) // itens_por_pagina + 1)
         
-        inicio_idx = st.session_state.page * itens_por_pagina
+        if st.session_state.page[local_selecionado] >= total_paginas:
+            st.session_state.page[local_selecionado] = 0
+            
+        inicio_idx = st.session_state.page[local_selecionado] * itens_por_pagina
         fim_idx = inicio_idx + itens_por_pagina
-        imagens_atuais = st.session_state.img_gallery[inicio_idx:fim_idx]
+        imagens_atuais = galeria_local_atual[inicio_idx:fim_idx]
         
         cols = st.columns(5)
         for idx, item in enumerate(imagens_atuais):
@@ -533,14 +493,14 @@ if st.session_state.deteccoes:
             st.write("") 
             col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
             with col_pg_esq:
-                if st.session_state.page > 0:
-                    if st.button("⬅️ Anterior", use_container_width=True):
-                        st.session_state.page -= 1
+                if st.session_state.page[local_selecionado] > 0:
+                    if st.button("⬅️ Anterior", use_container_width=True, key="pg_prev"):
+                        st.session_state.page[local_selecionado] -= 1
                         st.rerun()
             with col_pg_centro:
-                st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Mostrando imagens {inicio_idx + 1} a {min(fim_idx, total_imagens)} (Página {st.session_state.page + 1} de {total_paginas})</h5>", unsafe_allow_html=True)
+                st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
             with col_pg_dir:
-                if st.session_state.page < total_paginas - 1:
-                    if st.button("Próxima ➡️", use_container_width=True):
-                        st.session_state.page += 1
+                if st.session_state.page[local_selecionado] < total_paginas - 1:
+                    if st.button("Próxima ➡️", use_container_width=True, key="pg_next"):
+                        st.session_state.page[local_selecionado] += 1
                         st.rerun()
