@@ -12,6 +12,7 @@ def install_dependencies():
             if 'dependencies_installed' not in os.environ:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-image", "scipy"])
                 os.environ['dependencies_installed'] = '1'
         except Exception as e:
             print(f"Erro ao instalar dependências: {e}")
@@ -24,6 +25,8 @@ import numpy as np
 import cv2
 import io
 import zipfile
+import skimage.morphology as morph
+import scipy.ndimage as ndi
 from ultralytics import YOLO
 from datetime import datetime
 from scipy.spatial import cKDTree
@@ -41,7 +44,6 @@ LIMITES_PROFUNDIDADE = {
     "Patim": (180, 223)
 }
 
-# Separação por Sonda (Lado Esquerdo / Direito)
 SONDAS_ESQUERDA = [0, 6, 8, 4, 10]
 SONDAS_DIREITA = [1, 7, 9, 5, 11]
 
@@ -135,7 +137,7 @@ def load_ov_model(nome_pt):
                 s.update(label="Otimização Concluída!", state="complete")
         else:
             return None 
-    return YOLO(path_ov, task='detect')
+    return YOLO(path_ov, task='segment') # Força tarefa de segmentação
 
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     width, height = 1500, 500
@@ -293,21 +295,35 @@ if btn_run and arquivos_prontos:
                     
                     if len(results[0].boxes) > 0:
                         raw_dets = []
-                        for box in results[0].boxes:
-                            raw_dets.append({'box': box.xyxy[0].cpu().numpy().astype(int), 'conf': float(box.conf), 'cls_nome': model.names[int(box.cls)], 'cls_id': int(box.cls)})
+                        h_img, w_img = img_clean.shape[:2]
+                        
+                        # Extrai Caixas e as Máscaras de Segmentação (Polígonos) do YOLO
+                        masks_xy = results[0].masks.xy if hasattr(results[0], 'masks') and results[0].masks is not None else [None] * len(results[0].boxes)
+                        
+                        for i, box in enumerate(results[0].boxes):
+                            mask_u8 = np.zeros((h_img, w_img), dtype=np.uint8)
+                            poly = masks_xy[i]
+                            
+                            if poly is not None and len(poly) > 0:
+                                cv2.fillPoly(mask_u8, [np.array(poly, dtype=np.int32)], 1)
+                                
+                            raw_dets.append({
+                                'box': box.xyxy[0].cpu().numpy().astype(int),
+                                'conf': float(box.conf),
+                                'cls_nome': model.names[int(box.cls)],
+                                'cls_id': int(box.cls),
+                                'mask': mask_u8 > 0 # Máscara booleana exata do defeito
+                            })
                         
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
-                        final_dets = []
                         
+                        # --- FASE 1: FUSÃO GEOMÉTRICA (Merge Bounding Box e Segmentation Masks) ---
+                        dets_mescladas = []
                         for d in raw_dets:
                             bx1, duplicado = d['box'], False
-                            for f in final_dets:
+                            for f in dets_mescladas:
                                 if d['cls_id'] == f['cls_id']:
                                     bx2 = f['box']
-                                    
-                                    # ⚠️ LÓGICA DE FUSÃO POR PROXIMIDADE (VIRTUAL EXPANSION)
-                                    # Se a classe for Furo (ou furo), expandimos a caixa em 15 pixels (~48mm reais).
-                                    # Assim, se a rede dividir um furo em dois pedaços próximos, eles serão unificados.
                                     margem = 15 if d['cls_nome'].lower() == 'furo' else 0
                                     
                                     xl = max(bx1[0] - margem, bx2[0] - margem)
@@ -317,29 +333,106 @@ if btn_run and arquivos_prontos:
                                     
                                     if xr > xl and yb > yt:
                                         if d['cls_nome'].lower() == 'furo':
-                                            # Se as caixas expandidas se tocarem, deleta a duplicidade do Furo
+                                            # MESCLA BBOX
+                                            f['box'][0] = min(bx1[0], bx2[0])
+                                            f['box'][1] = min(bx1[1], bx2[1])
+                                            f['box'][2] = max(bx1[2], bx2[2])
+                                            f['box'][3] = max(bx1[3], bx2[3])
+                                            # MESCLA AS MÁSCARAS DE SEGMENTAÇÃO (Logical OR)
+                                            f['mask'] = f['mask'] | d['mask']
                                             duplicado = True
                                             break
                                         else:
-                                            # Para outras classes, aplica NMS matemático padrão
                                             area_inter = (xr-xl)*(yb-yt)
                                             area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
                                             limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.15
                                             
                                             if (area_inter / area_min) > limite_nms:
-                                                duplicado = True
-                                                break
-                            if not duplicado: final_dets.append(d)
+                                                duplicado = True; break
+                            if not duplicado: 
+                                dets_mescladas.append(d)
 
+                        # --- FASE 2: FILTROS HEURÍSTICOS EM CIMA DAS MÁSCARAS ---
+                        furos_mesclados = [d for d in dets_mescladas if d['cls_nome'].lower() == 'furo']
+                        
+                        avg_area, avg_asp = 0, 0
+                        margem_area, margem_asp = 0, 0
+                        
+                        # b) Area/Aspect Ratio Outliers
+                        if furos_mesclados:
+                            # Área = contagem EXATA de pixels na máscara (MUITO mais preciso que o Box)
+                            areas = np.array([np.sum(d['mask']) for d in furos_mesclados])
+                            aspects = np.array([(d['box'][2]-d['box'][0]) / max(1, d['box'][3]-d['box'][1]) for d in furos_mesclados])
+                            
+                            avg_area, avg_asp = np.mean(areas), np.mean(aspects)
+                            
+                            if len(furos_mesclados) > 2:
+                                z_areas = np.abs((areas - avg_area) / (np.std(areas) + 1e-6))
+                                z_aspects = np.abs((aspects - avg_asp) / (np.std(aspects) + 1e-6))
+                                
+                                clean_areas = areas[z_areas < 1.5]
+                                clean_aspects = aspects[z_aspects < 1.5]
+                                
+                                avg_area = np.mean(clean_areas) if len(clean_areas) > 0 else avg_area
+                                avg_asp = np.mean(clean_aspects) if len(clean_aspects) > 0 else avg_asp
+                                
+                            margem_area = avg_area * 0.40 # 40% de margem
+                            margem_asp = avg_asp * 0.40
+
+                        final_dets = []
+                        for d in dets_mescladas:
+                            if d['cls_nome'].lower() == 'furo':
+                                mask_full = d['mask']
+                                
+                                # a) Tem_Roxo_e_Verde? (Somente onde a máscara existe)
+                                is_purple = (img_clean[:, :, 0] == 128) & (img_clean[:, :, 1] == 0) & (img_clean[:, :, 2] == 128)
+                                is_green = (img_clean[:, :, 0] == 0) & (img_clean[:, :, 1] == 128) & (img_clean[:, :, 2] == 0)
+                                
+                                has_purple = np.any(is_purple & mask_full)
+                                has_green = np.any(is_green & mask_full)
+                                
+                                if not (has_purple and has_green):
+                                    continue # DESCARTA: Ausência de cores chave na máscara
+                                
+                                # b) Area / Aspect Filtro
+                                if len(furos_mesclados) > 2:
+                                    d_area = np.sum(mask_full)
+                                    d_aspect = (d['box'][2] - d['box'][0]) / max(1, d['box'][3] - d['box'][1])
+                                    if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
+                                        continue # DESCARTA: Outlier Morfológico
+                                
+                                # c) Endpoints OK?
+                                x1, y1, x2, y2 = d['box']
+                                # Cropping com padding de segurança para não perder bordas do esqueleto
+                                px1, py1 = max(0, x1-5), max(0, y1-5)
+                                px2, py2 = min(w_img, x2+5), min(h_img, y2+5)
+                                roi_mask = mask_full[py1:py2, px1:px2]
+                                
+                                skeleton = morph.skeletonize(roi_mask)
+                                kernel = np.array([[1, 1, 1], [1, 10, 1], [1, 1, 1]])
+                                neighbor_count = ndi.convolve(skeleton.astype(np.uint8), kernel, mode='constant', cval=0)
+                                endpoints = np.sum(neighbor_count == 11)
+                                
+                                if endpoints != 4:
+                                    continue # DESCARTA: Geometria divergente da parábola de ultrassom
+                                    
+                            final_dets.append(d)
+
+                        # --- FASE 3: DESENHO FINAL E EXPORTAÇÃO ---
                         if final_dets:
                             img_draw = img_clean.copy()
-                            h, w, _ = img_draw.shape
                             for local_id, d in enumerate(final_dets, 1):
                                 x1, y1, x2, y2 = d['box']
+                                
+                                # Desenha a caixa delimitadora
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
-                                px1, px2, py1, py2 = x1/w, x2/w, y1/h, y2/h
+                                # Opcional: Desenha o contorno da máscara de segmentação em amarelo para validação
+                                contours, _ = cv2.findContours(d['mask'].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                cv2.drawContours(img_draw, contours, -1, (0, 255, 255), 1)
+                                
+                                px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
                                 center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                 center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                 comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(delta_depth * py2) - int(delta_depth * py1))**2))
@@ -356,7 +449,7 @@ if btn_run and arquivos_prontos:
                                     'Comprimento(mm)': comprimento,
                                     'Confiança': f"{d['conf']:.2%}", 
                                     'Aprovado': True,
-                                    'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w:.6f} {((y1+y2)/2)/h:.6f} {(x2-x1)/w:.6f} {(y2-y1)/h:.6f}"
+                                    'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w_img:.6f} {((y1+y2)/2)/h_img:.6f} {(x2-x1)/w_img:.6f} {(y2-y1)/h_img:.6f}"
                                 })
                             gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
     
