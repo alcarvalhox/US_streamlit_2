@@ -135,7 +135,7 @@ def load_ov_model(nome_pt):
                 s.update(label="Otimização Concluída!", state="complete")
         else:
             return None 
-    return YOLO(path_ov, task='detect') 
+    return YOLO(path_ov, task='segment') 
 
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     width, height = 1500, 500
@@ -293,12 +293,28 @@ if btn_run and arquivos_prontos:
                     
                     if len(results[0].boxes) > 0:
                         raw_dets = []
-                        for box in results[0].boxes:
-                            raw_dets.append({'box': box.xyxy[0].cpu().numpy().astype(int), 'conf': float(box.conf), 'cls_nome': model.names[int(box.cls)], 'cls_id': int(box.cls)})
+                        h_img, w_img = img_clean.shape[:2]
+                        
+                        masks_xy = results[0].masks.xy if hasattr(results[0], 'masks') and results[0].masks is not None else [None] * len(results[0].boxes)
+                        
+                        for i, box in enumerate(results[0].boxes):
+                            mask_u8 = np.zeros((h_img, w_img), dtype=np.uint8)
+                            poly = masks_xy[i]
+                            
+                            if poly is not None and len(poly) > 0:
+                                cv2.fillPoly(mask_u8, [np.array(poly, dtype=np.int32)], 1)
+                                
+                            raw_dets.append({
+                                'box': box.xyxy[0].cpu().numpy().astype(int),
+                                'conf': float(box.conf),
+                                'cls_nome': model.names[int(box.cls)],
+                                'cls_id': int(box.cls),
+                                'mask': mask_u8 > 0 
+                            })
                         
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
                         
-                        # --- FASE 1: FUSÃO GEOMÉTRICA (NMS / MESCLAGEM) ---
+                        # --- FASE 1: FUSÃO GEOMÉTRICA (NMS Matemático Rigoroso) ---
                         dets_mescladas = []
                         for d in raw_dets:
                             bx1, duplicado = d['box'], False
@@ -309,95 +325,92 @@ if btn_run and arquivos_prontos:
                                     xl, yt = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
                                     xr, yb = min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
                                     
-                                    # Para corrigir a imagem de exemplo (multi-furos aglomerados),
-                                    # aplicamos NMS rigoroso matemática de sobreposição, 
-                                    # não proximidade por margem, para separar ecos independentes.
                                     if xr > xl and yb > yt:
                                         area_inter = (xr-xl)*(yb-yt)
                                         area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
                                         
-                                        # ⚠️ LIMITE NMS FURO RIGOROSO: Permite caixas separadas se sobreposição for < 15%
                                         limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.15
                                         
                                         if (area_inter / area_min) > limite_nms:
-                                            # Mescla as caixas fisicamente
                                             f['box'][0] = min(bx1[0], bx2[0])
                                             f['box'][1] = min(bx1[1], bx2[1])
                                             f['box'][2] = max(bx1[2], bx2[2])
                                             f['box'][3] = max(bx1[3], bx2[3])
+                                            f['mask'] = f['mask'] | d['mask']
                                             duplicado = True
                                             break
                             if not duplicado: 
                                 dets_mescladas.append(d)
 
-                        # --- FASE 2: FILTROS HEURÍSTICOS (APÓS A FUSÃO/SEPARAÇÃO) ---
-                        furos_mesclados = [d for d in dets_mescladas if d['cls_nome'].lower() == 'furo']
+                        # --- FASE 2: FILTROS HEURÍSTICOS (Nova Lógica em Cascata) ---
                         
-                        clean_avg_area, clean_avg_asp = 0, 0
-                        margem_area, margem_asp = 0, 0
-                        
-                        # Cálculo da Média Limpa de Outliers (Regra b) baseada no Bounding Box
-                        if furos_mesclados:
-                            # ⚠️ CONFORME SOLICITADO: Usa área e aspecto estritamente do BOUNDING BOX
-                            areas = np.array([(d['box'][2]-d['box'][0]) * max(1, d['box'][3]-d['box'][1]) for d in furos_mesclados])
-                            aspects = np.array([(d['box'][2]-d['box'][0]) / max(1, d['box'][3]-d['box'][1]) for d in furos_mesclados])
-                            
-                            clean_avg_area, clean_avg_asp = np.mean(areas), np.mean(aspects)
-                            
-                            # Filtro estatístico Z-Score para remover falsos positivos de ecos muito pequenos ou grandes
-                            if len(furos_mesclados) > 2:
-                                z_areas = np.abs((areas - clean_avg_area) / (np.std(areas) + 1e-6))
-                                z_aspects = np.abs((aspects - clean_avg_asp) / (np.std(aspects) + 1e-6))
-                                
-                                data_limpa_areas = areas[z_areas < 1.5]
-                                data_limpa_aspects = aspects[z_aspects < 1.5]
-                                
-                                clean_avg_area = np.mean(data_limpa_areas) if len(data_limpa_areas) > 0 else clean_avg_area
-                                clean_avg_asp = np.mean(data_limpa_aspects) if len(data_limpa_aspects) > 0 else clean_avg_asp
-                                
-                            # ⚠️ MARGEM DE ÁREA RIGOROSA: Aceita apenas 40% de desvio da média limpa para cortar ruídos pequenos
-                            margem_area = clean_avg_area * 0.40 
-                            margem_asp = clean_avg_asp * 0.40
-
-                        final_dets = []
+                        # Passo 2A: Filtro de Cor RIGOROSO aplicado ANTES da média
+                        furos_color_pass = []
                         for d in dets_mescladas:
                             if d['cls_nome'].lower() == 'furo':
                                 x1, y1, x2, y2 = d['box']
                                 roi_bbox = img_clean[y1:y2, x1:x2]
                                 
-                                is_purple = (roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128)
-                                is_green = (roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0)
+                                has_purple = np.any((roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128))
+                                has_green = np.any((roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0))
                                 
-                                has_purple = np.any(is_purple)
-                                has_green = np.any(is_green)
-                                
-                                # FILTRO 1: Obriga Roxo OU Verde (Relaxado para absorver variabilidade real)
-                                if not (has_purple or has_green):
-                                    continue 
-                                
-                                # FILTRO 2: Área e Aspect Ratio baseada na média limpa do Z-Score
-                                if len(furos_mesclados) > 2:
+                                # EXIGE OBRIGATORIAMENTE ROXO E VERDE NO BB
+                                if has_purple and has_green:
+                                    furos_color_pass.append(d)
+                            else:
+                                furos_color_pass.append(d) # Preserva outras classes
+
+                        # Passo 2B: Filtro de Área aplicado APENAS sobre furos matematicamente válidos
+                        furos_validos = [d for d in furos_color_pass if d['cls_nome'].lower() == 'furo']
+                        
+                        avg_area, avg_asp = 0, 0
+                        margem_area, margem_asp = 0, 0
+                        
+                        if len(furos_validos) > 2:
+                            areas = np.array([(d['box'][2]-d['box'][0]) * max(1, d['box'][3]-d['box'][1]) for d in furos_validos])
+                            aspects = np.array([(d['box'][2]-d['box'][0]) / max(1, d['box'][3]-d['box'][1]) for d in furos_validos])
+                            
+                            z_areas = np.abs((areas - np.mean(areas)) / (np.std(areas) + 1e-6))
+                            z_aspects = np.abs((aspects - np.mean(aspects)) / (np.std(aspects) + 1e-6))
+                            
+                            clean_areas = areas[z_areas < 1.5]
+                            clean_aspects = aspects[z_aspects < 1.5]
+                            
+                            avg_area = np.mean(clean_areas) if len(clean_areas) > 0 else np.mean(areas)
+                            avg_asp = np.mean(clean_aspects) if len(clean_aspects) > 0 else np.mean(aspects)
+                            
+                            # Margem expandida para 70% para proteger detecções grandes autênticas
+                            margem_area = avg_area * 0.70 
+                            margem_asp = avg_asp * 0.70
+
+                        final_dets = []
+                        for d in furos_color_pass:
+                            if d['cls_nome'].lower() == 'furo':
+                                if len(furos_validos) > 2:
+                                    x1, y1, x2, y2 = d['box']
                                     d_area = (x2 - x1) * max(1, y2 - y1)
                                     d_aspect = (x2 - x1) / max(1, y2 - y1)
-                                    if abs(d_area - clean_avg_area) > margem_area or abs(d_aspect - clean_avg_asp) > margem_asp:
-                                        #DESCARTA FALSO POSITIVO PEQUENO OU GRANDE
-                                        continue 
-                                
-                                # FILTRO 3: Endpoints (Removido conforme solicitado)
                                     
+                                    if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
+                                        continue 
+                                        
                             final_dets.append(d)
 
                         # --- FASE 3: DESENHO FINAL E EXPORTAÇÃO ---
                         if final_dets:
                             img_draw = img_clean.copy()
-                            h, w, _ = img_draw.shape
                             for local_id, d in enumerate(final_dets, 1):
                                 x1, y1, x2, y2 = d['box']
+                                
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
-                                # ⚠️ TEXTO EM PRETO ABSOLUTO PARA LEGIBILIDADE NO B-SCAN BRANCO
+                                # Texto ajustado para preto para não sumir no fundo branco
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
-                                px1, px2, py1, py2 = x1/w, x2/w, y1/h, y2/h
+                                color_contour = (255, 255, 0) if d['cls_nome'].lower() == 'furo' else (0, 255, 255)
+                                contours, _ = cv2.findContours(d['mask'].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                                cv2.drawContours(img_draw, contours, -1, color_contour, 2)
+                                
+                                px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
                                 center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                 center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                 comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(delta_depth * py2) - int(delta_depth * py1))**2))
@@ -414,7 +427,7 @@ if btn_run and arquivos_prontos:
                                     'Comprimento(mm)': comprimento,
                                     'Confiança': f"{d['conf']:.2%}", 
                                     'Aprovado': True,
-                                    'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w:.6f} {((y1+y2)/2)/h:.6f} {(x2-x1)/w:.6f} {(y2-y1)/h:.6f}"
+                                    'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w_img:.6f} {((y1+y2)/2)/h_img:.6f} {(x2-x1)/w_img:.6f} {(y2-y1)/h_img:.6f}"
                                 })
                             gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
     
