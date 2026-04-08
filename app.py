@@ -289,6 +289,7 @@ if btn_run and arquivos_prontos:
                     img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
                     
+                    # Confiança levemente reduzida para pescar furos tênues. O filtro de solidez cuidará dos falsos positivos.
                     results = model.predict(img_clean, verbose=False, conf=0.15)
                     
                     if len(results[0].boxes) > 0:
@@ -342,26 +343,32 @@ if btn_run and arquivos_prontos:
                             if not duplicado: 
                                 dets_mescladas.append(d)
 
-                        # --- FASE 2: FILTROS HEURÍSTICOS (Nova Lógica em Cascata) ---
+                        # --- FASE 2: FILTROS HEURÍSTICOS (Nova Lógica V4 Injetada) ---
                         
-                        # Passo 2A: Filtro de Cor RIGOROSO aplicado ANTES da média
-                        furos_color_pass = []
+                        # 2A. Filtro de Cor Rigoroso E Solidez (Pré-Aprovação para formar a Média)
+                        furos_pre_aprovados = []
                         for d in dets_mescladas:
                             if d['cls_nome'].lower() == 'furo':
                                 x1, y1, x2, y2 = d['box']
                                 roi_bbox = img_clean[y1:y2, x1:x2]
                                 
+                                # EXIGE OBRIGATORIAMENTE ROXO E VERDE NO BB INTEIRO
                                 has_purple = np.any((roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128))
                                 has_green = np.any((roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0))
                                 
-                                # EXIGE OBRIGATORIAMENTE ROXO E VERDE NO BB
-                                if has_purple and has_green:
-                                    furos_color_pass.append(d)
+                                # CÁLCULO DE SOLIDEZ (Área da Máscara / Área do Bounding Box)
+                                bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
+                                polygon_area = np.sum(d['mask'])
+                                solidity = polygon_area / bbox_area if bbox_area > 0 else 0
+                                
+                                # Condição: Tem as duas cores AND preenche pelo menos 30% da caixa
+                                if has_purple and has_green and solidity >= 0.30:
+                                    furos_pre_aprovados.append(d)
                             else:
-                                furos_color_pass.append(d) # Preserva outras classes
+                                furos_pre_aprovados.append(d) # Preserva outras classes
 
-                        # Passo 2B: Filtro de Área aplicado APENAS sobre furos matematicamente válidos
-                        furos_validos = [d for d in furos_color_pass if d['cls_nome'].lower() == 'furo']
+                        # 2B. Cálculo da Área Média Pura e Filtro Final
+                        furos_validos = [d for d in furos_pre_aprovados if d['cls_nome'].lower() == 'furo']
                         
                         avg_area, avg_asp = 0, 0
                         margem_area, margem_asp = 0, 0
@@ -379,12 +386,12 @@ if btn_run and arquivos_prontos:
                             avg_area = np.mean(clean_areas) if len(clean_areas) > 0 else np.mean(areas)
                             avg_asp = np.mean(clean_aspects) if len(clean_aspects) > 0 else np.mean(aspects)
                             
-                            # Margem expandida para 70% para proteger detecções grandes autênticas
+                            # Margem expandida para 70% da área média limpa
                             margem_area = avg_area * 0.70 
                             margem_asp = avg_asp * 0.70
 
                         final_dets = []
-                        for d in furos_color_pass:
+                        for d in furos_pre_aprovados:
                             if d['cls_nome'].lower() == 'furo':
                                 if len(furos_validos) > 2:
                                     x1, y1, x2, y2 = d['box']
@@ -392,7 +399,7 @@ if btn_run and arquivos_prontos:
                                     d_aspect = (x2 - x1) / max(1, y2 - y1)
                                     
                                     if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
-                                        continue 
+                                        continue # Descarta furos que fogem muito da média real
                                         
                             final_dets.append(d)
 
@@ -403,7 +410,7 @@ if btn_run and arquivos_prontos:
                                 x1, y1, x2, y2 = d['box']
                                 
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
-                                # Texto ajustado para preto para não sumir no fundo branco
+                                # Texto em preto para garantir leitura no fundo branco do B-Scan
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
                                 color_contour = (255, 255, 0) if d['cls_nome'].lower() == 'furo' else (0, 255, 255)
