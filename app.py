@@ -12,7 +12,7 @@ def install_dependencies():
             if 'dependencies_installed' not in os.environ:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl"])
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "scikit-image", "scipy"])
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "scipy"])
                 os.environ['dependencies_installed'] = '1'
         except Exception as e:
             print(f"Erro ao instalar dependências: {e}")
@@ -25,8 +25,6 @@ import numpy as np
 import cv2
 import io
 import zipfile
-import skimage.morphology as morph
-import scipy.ndimage as ndi
 from ultralytics import YOLO
 from datetime import datetime
 from scipy.spatial import cKDTree
@@ -316,7 +314,7 @@ if btn_run and arquivos_prontos:
                         
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
                         
-                        # --- FASE 1: FUSÃO GEOMÉTRICA (Merge Bounding Box e Segmentation Masks) ---
+                        # --- FASE 1: FUSÃO GEOMÉTRICA ---
                         dets_mescladas = []
                         for d in raw_dets:
                             bx1, duplicado = d['box'], False
@@ -349,14 +347,15 @@ if btn_run and arquivos_prontos:
                             if not duplicado: 
                                 dets_mescladas.append(d)
 
-                        # --- FASE 2: FILTROS HEURÍSTICOS ---
+                        # --- FASE 2: FILTROS HEURÍSTICOS (Correção de Área e Cor) ---
                         furos_mesclados = [d for d in dets_mescladas if d['cls_nome'].lower() == 'furo']
                         
                         avg_area, avg_asp = 0, 0
                         margem_area, margem_asp = 0, 0
                         
                         if furos_mesclados:
-                            areas = np.array([np.sum(d['mask']) for d in furos_mesclados])
+                            # ⚠️ ÁREA E ASPECTO REVERTIDOS PARA O BOUNDING BOX
+                            areas = np.array([(d['box'][2]-d['box'][0]) * max(1, d['box'][3]-d['box'][1]) for d in furos_mesclados])
                             aspects = np.array([(d['box'][2]-d['box'][0]) / max(1, d['box'][3]-d['box'][1]) for d in furos_mesclados])
                             
                             avg_area, avg_asp = np.mean(areas), np.mean(aspects)
@@ -377,36 +376,29 @@ if btn_run and arquivos_prontos:
                         final_dets = []
                         for d in dets_mescladas:
                             if d['cls_nome'].lower() == 'furo':
-                                mask_full = d['mask']
+                                x1, y1, x2, y2 = d['box']
                                 
-                                is_purple = (img_clean[:, :, 0] == 128) & (img_clean[:, :, 1] == 0) & (img_clean[:, :, 2] == 128)
-                                is_green = (img_clean[:, :, 0] == 0) & (img_clean[:, :, 1] == 128) & (img_clean[:, :, 2] == 0)
+                                # ⚠️ VERIFICAÇÃO DE COR DENTRO DO BBOX INTEIRO (Ignora as quebras da máscara)
+                                roi_bbox = img_clean[y1:y2, x1:x2]
                                 
-                                has_purple = np.any(is_purple & mask_full)
-                                has_green = np.any(is_green & mask_full)
+                                is_purple = (roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128)
+                                is_green = (roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0)
                                 
-                                # ⚠️ FILTRO A: Exige estritamente ROXO e VERDE dentro da segmentação
+                                has_purple = np.any(is_purple)
+                                has_green = np.any(is_green)
+                                
+                                # FILTRO 1: Obriga Roxo E Verde
                                 if not (has_purple and has_green):
                                     continue 
                                 
+                                # FILTRO 2: Área e Aspect Ratio baseado no BBox
                                 if len(furos_mesclados) > 2:
-                                    d_area = np.sum(mask_full)
-                                    d_aspect = (d['box'][2] - d['box'][0]) / max(1, d['box'][3] - d['box'][1])
+                                    d_area = (x2 - x1) * max(1, y2 - y1)
+                                    d_aspect = (x2 - x1) / max(1, y2 - y1)
                                     if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
                                         continue 
                                 
-                                x1, y1, x2, y2 = d['box']
-                                px1, py1 = max(0, x1-5), max(0, y1-5)
-                                px2, py2 = min(w_img, x2+5), min(h_img, y2+5)
-                                roi_mask = mask_full[py1:py2, px1:px2]
-                                
-                                skeleton = morph.skeletonize(roi_mask)
-                                kernel = np.array([[1, 1, 1], [1, 10, 1], [1, 1, 1]])
-                                neighbor_count = ndi.convolve(skeleton.astype(np.uint8), kernel, mode='constant', cval=0)
-                                endpoints = np.sum(neighbor_count == 11)
-                                
-                                if not (2 <= endpoints <= 6):
-                                    continue 
+                                # FILTRO 3: Endpoints (Removido)
                                     
                             final_dets.append(d)
 
@@ -419,6 +411,7 @@ if btn_run and arquivos_prontos:
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
+                                # Desenha o contorno da máscara para auditoria
                                 color_contour = (255, 255, 0) if d['cls_nome'].lower() == 'furo' else (0, 255, 255)
                                 contours, _ = cv2.findContours(d['mask'].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                                 cv2.drawContours(img_draw, contours, -1, color_contour, 2)
