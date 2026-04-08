@@ -137,7 +137,7 @@ def load_ov_model(nome_pt):
                 s.update(label="Otimização Concluída!", state="complete")
         else:
             return None 
-    return YOLO(path_ov, task='segment') # Força tarefa de segmentação
+    return YOLO(path_ov, task='segment') 
 
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     width, height = 1500, 500
@@ -297,7 +297,6 @@ if btn_run and arquivos_prontos:
                         raw_dets = []
                         h_img, w_img = img_clean.shape[:2]
                         
-                        # Extrai Caixas e as Máscaras de Segmentação (Polígonos) do YOLO
                         masks_xy = results[0].masks.xy if hasattr(results[0], 'masks') and results[0].masks is not None else [None] * len(results[0].boxes)
                         
                         for i, box in enumerate(results[0].boxes):
@@ -312,7 +311,7 @@ if btn_run and arquivos_prontos:
                                 'conf': float(box.conf),
                                 'cls_nome': model.names[int(box.cls)],
                                 'cls_id': int(box.cls),
-                                'mask': mask_u8 > 0 # Máscara booleana exata do defeito
+                                'mask': mask_u8 > 0 
                             })
                         
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
@@ -333,12 +332,10 @@ if btn_run and arquivos_prontos:
                                     
                                     if xr > xl and yb > yt:
                                         if d['cls_nome'].lower() == 'furo':
-                                            # MESCLA BBOX
                                             f['box'][0] = min(bx1[0], bx2[0])
                                             f['box'][1] = min(bx1[1], bx2[1])
                                             f['box'][2] = max(bx1[2], bx2[2])
                                             f['box'][3] = max(bx1[3], bx2[3])
-                                            # MESCLA AS MÁSCARAS DE SEGMENTAÇÃO (Logical OR)
                                             f['mask'] = f['mask'] | d['mask']
                                             duplicado = True
                                             break
@@ -352,15 +349,13 @@ if btn_run and arquivos_prontos:
                             if not duplicado: 
                                 dets_mescladas.append(d)
 
-                        # --- FASE 2: FILTROS HEURÍSTICOS EM CIMA DAS MÁSCARAS ---
+                        # --- FASE 2: FILTROS HEURÍSTICOS ---
                         furos_mesclados = [d for d in dets_mescladas if d['cls_nome'].lower() == 'furo']
                         
                         avg_area, avg_asp = 0, 0
                         margem_area, margem_asp = 0, 0
                         
-                        # b) Area/Aspect Ratio Outliers
                         if furos_mesclados:
-                            # Área = contagem EXATA de pixels na máscara (MUITO mais preciso que o Box)
                             areas = np.array([np.sum(d['mask']) for d in furos_mesclados])
                             aspects = np.array([(d['box'][2]-d['box'][0]) / max(1, d['box'][3]-d['box'][1]) for d in furos_mesclados])
                             
@@ -376,34 +371,31 @@ if btn_run and arquivos_prontos:
                                 avg_area = np.mean(clean_areas) if len(clean_areas) > 0 else avg_area
                                 avg_asp = np.mean(clean_aspects) if len(clean_aspects) > 0 else avg_asp
                                 
-                            margem_area = avg_area * 0.40 # 40% de margem
-                            margem_asp = avg_asp * 0.40
+                            margem_area = avg_area * 0.60 
+                            margem_asp = avg_asp * 0.60
 
                         final_dets = []
                         for d in dets_mescladas:
                             if d['cls_nome'].lower() == 'furo':
                                 mask_full = d['mask']
                                 
-                                # a) Tem_Roxo_e_Verde? (Somente onde a máscara existe)
                                 is_purple = (img_clean[:, :, 0] == 128) & (img_clean[:, :, 1] == 0) & (img_clean[:, :, 2] == 128)
                                 is_green = (img_clean[:, :, 0] == 0) & (img_clean[:, :, 1] == 128) & (img_clean[:, :, 2] == 0)
                                 
                                 has_purple = np.any(is_purple & mask_full)
                                 has_green = np.any(is_green & mask_full)
                                 
+                                # ⚠️ FILTRO A: Exige estritamente ROXO e VERDE dentro da segmentação
                                 if not (has_purple and has_green):
-                                    continue # DESCARTA: Ausência de cores chave na máscara
+                                    continue 
                                 
-                                # b) Area / Aspect Filtro
                                 if len(furos_mesclados) > 2:
                                     d_area = np.sum(mask_full)
                                     d_aspect = (d['box'][2] - d['box'][0]) / max(1, d['box'][3] - d['box'][1])
                                     if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
-                                        continue # DESCARTA: Outlier Morfológico
+                                        continue 
                                 
-                                # c) Endpoints OK?
                                 x1, y1, x2, y2 = d['box']
-                                # Cropping com padding de segurança para não perder bordas do esqueleto
                                 px1, py1 = max(0, x1-5), max(0, y1-5)
                                 px2, py2 = min(w_img, x2+5), min(h_img, y2+5)
                                 roi_mask = mask_full[py1:py2, px1:px2]
@@ -413,8 +405,8 @@ if btn_run and arquivos_prontos:
                                 neighbor_count = ndi.convolve(skeleton.astype(np.uint8), kernel, mode='constant', cval=0)
                                 endpoints = np.sum(neighbor_count == 11)
                                 
-                                if endpoints != 4:
-                                    continue # DESCARTA: Geometria divergente da parábola de ultrassom
+                                if not (2 <= endpoints <= 6):
+                                    continue 
                                     
                             final_dets.append(d)
 
@@ -424,13 +416,12 @@ if btn_run and arquivos_prontos:
                             for local_id, d in enumerate(final_dets, 1):
                                 x1, y1, x2, y2 = d['box']
                                 
-                                # Desenha a caixa delimitadora
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
-                                # Opcional: Desenha o contorno da máscara de segmentação em amarelo para validação
+                                color_contour = (255, 255, 0) if d['cls_nome'].lower() == 'furo' else (0, 255, 255)
                                 contours, _ = cv2.findContours(d['mask'].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                cv2.drawContours(img_draw, contours, -1, (0, 255, 255), 1)
+                                cv2.drawContours(img_draw, contours, -1, color_contour, 2)
                                 
                                 px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
                                 center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
