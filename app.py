@@ -289,7 +289,6 @@ if btn_run and arquivos_prontos:
                     img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
                     
-                    # Limiar de Confiança Menor = 0.10
                     results = model.predict(img_clean, verbose=False, conf=0.10)
                     
                     if len(results[0].boxes) > 0:
@@ -313,63 +312,69 @@ if btn_run and arquivos_prontos:
                                 'mask': mask_u8 > 0 
                             })
                         
+                        # Sort by confidence descending to ensure higher confidence dominates
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
                         
-                        # --- FASE 1: FUSÃO GEOMÉTRICA (NMS Matemático Rigoroso) ---
+                        # --- FASE 1: FUSÃO GEOMÉTRICA & SUPRESSÃO INTER-CLASSE ---
                         dets_mescladas = []
                         for d in raw_dets:
-                            bx1, duplicado = d['box'], False
+                            bx1, duplicado_ou_suprimido = d['box'], False
                             for f in dets_mescladas:
-                                if d['cls_id'] == f['cls_id']:
-                                    bx2 = f['box']
+                                bx2 = f['box']
+                                xl, yt = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
+                                xr, yb = min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
+                                
+                                if xr > xl and yb > yt:
+                                    area_inter = (xr-xl)*(yb-yt)
+                                    area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
+                                    limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.15
                                     
-                                    xl, yt = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
-                                    xr, yb = min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
-                                    
-                                    if xr > xl and yb > yt:
-                                        area_inter = (xr-xl)*(yb-yt)
-                                        area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
-                                        
-                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.15
-                                        
-                                        if (area_inter / area_min) > limite_nms:
+                                    if (area_inter / area_min) > limite_nms:
+                                        # ==========================================================
+                                        # ⚠️ AJUSTE 3: Impedir detecção de 2 classes no mesmo objeto.
+                                        # Se for a mesma classe: Funde as caixas e as máscaras.
+                                        # Se for classe diferente: A atual 'd' (que tem confiança menor) é suprimida/descartada.
+                                        # ==========================================================
+                                        if d['cls_id'] == f['cls_id']:
                                             f['box'][0] = min(bx1[0], bx2[0])
                                             f['box'][1] = min(bx1[1], bx2[1])
                                             f['box'][2] = max(bx1[2], bx2[2])
                                             f['box'][3] = max(bx1[3], bx2[3])
                                             f['mask'] = f['mask'] | d['mask']
-                                            duplicado = True
-                                            break
-                            if not duplicado: 
+                                        
+                                        duplicado_ou_suprimido = True
+                                        break
+                            if not duplicado_ou_suprimido: 
                                 dets_mescladas.append(d)
 
-                        # --- FASE 2: FILTROS HEURÍSTICOS (Nova Lógica V4 Injetada) ---
-                        
-                        # 2A. Filtro de Cor Rigoroso E Solidez (Pré-Aprovação para formar a Média)
+                        # --- FASE 2: FILTROS HEURÍSTICOS ---
                         furos_pre_aprovados = []
                         for d in dets_mescladas:
-                            if d['cls_nome'].lower() == 'furo':
-                                x1, y1, x2, y2 = d['box']
+                            cls_lower = d['cls_nome'].lower()
+                            x1, y1, x2, y2 = d['box']
+                            bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
+                            
+                            # ==========================================================
+                            # ⚠️ AJUSTE 1: Descartar "Furo" e "BHC" menores que 2900 px
+                            # ==========================================================
+                            if cls_lower in ['furo', 'bhc'] and bbox_area < 2900:
+                                continue # Ignora imediatamente objetos muito pequenos dessas classes
+                            
+                            if cls_lower == 'furo':
                                 roi_bbox = img_clean[y1:y2, x1:x2]
                                 
-                                # EXIGE OBRIGATORIAMENTE ROXO E VERDE NO BB INTEIRO
                                 has_purple = np.any((roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128))
                                 has_green = np.any((roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0))
                                 
-                                # CÁLCULO DE SOLIDEZ E ÁREA
-                                bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
                                 polygon_area = np.sum(d['mask'])
                                 solidity = polygon_area / bbox_area if bbox_area > 0 else 0
                                 
-                                # Área Mínima Absoluta de 150 px
-                                AREA_MINIMA_BBOX = 150 
-                                
-                                if has_purple and has_green and solidity >= 0.30 and bbox_area >= AREA_MINIMA_BBOX:
+                                if has_purple and has_green and solidity >= 0.30:
                                     furos_pre_aprovados.append(d)
                             else:
                                 furos_pre_aprovados.append(d) 
 
-                        # 2B. Cálculo da Área Média Pura e Filtro Final
+                        # 2B. Cálculo da Área Média Pura (Apenas para furos válidos da etapa anterior)
                         furos_validos = [d for d in furos_pre_aprovados if d['cls_nome'].lower() == 'furo']
                         
                         avg_area, avg_asp = 0, 0
@@ -409,16 +414,15 @@ if btn_run and arquivos_prontos:
                             img_draw = img_clean.copy()
                             for local_id, d in enumerate(final_dets, 1):
                                 x1, y1, x2, y2 = d['box']
-                                
-                                # ⚠️ AJUSTE DA TABELA 1: Calculando a área da caixa (px) para salvar
                                 area_caixa = max(1, x2 - x1) * max(1, y2 - y1)
                                 
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
-                                color_contour = (255, 255, 0) if d['cls_nome'].lower() == 'furo' else (0, 255, 255)
-                                contours, _ = cv2.findContours(d['mask'].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                                cv2.drawContours(img_draw, contours, -1, color_contour, 2)
+                                # ==========================================================
+                                # ⚠️ AJUSTE 2: Desenho da Máscara foi completamente removido
+                                # As linhas de cv2.drawContours(...) foram suprimidas.
+                                # ==========================================================
                                 
                                 px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
                                 center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
@@ -435,7 +439,7 @@ if btn_run and arquivos_prontos:
                                     'Coordenada ODO(mm)': int(center_x_mm),
                                     'Coordenada Depth(mm)': int(center_y_mm),
                                     'Comprimento(mm)': comprimento,
-                                    'Área (px)': int(area_caixa), # ⚠️ ADICIONADO AQUI
+                                    'Área (px)': int(area_caixa),
                                     'Confiança': f"{d['conf']:.2%}", 
                                     'Aprovado': True,
                                     'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w_img:.6f} {((y1+y2)/2)/h_img:.6f} {(x2-x1)/w_img:.6f} {(y2-y1)/h_img:.6f}"
@@ -606,7 +610,6 @@ if st.session_state.deteccoes or st.session_state.img_gallery:
                     df_imagem_atual = df_raw[mask].copy()
                     
                     if not df_imagem_atual.empty:
-                        # ⚠️ AJUSTE DA TABELA 2: Coluna 'Área (px)' injetada na visualização e nas travas do editor
                         edited_df = st.data_editor(
                             df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
                             column_config={
