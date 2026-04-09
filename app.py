@@ -289,8 +289,11 @@ if btn_run and arquivos_prontos:
                     img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
                     
-                    # Confiança levemente reduzida para pescar furos tênues. O filtro de solidez cuidará dos falsos positivos.
-                    results = model.predict(img_clean, verbose=False, conf=0.15)
+                    # ==========================================================
+                    # ⚠️ AJUSTE 1: Limiar de Confiança Menor
+                    # Reduzido de 0.15 para 0.10 para pescar furos tênues (Imagem 2)
+                    # ==========================================================
+                    results = model.predict(img_clean, verbose=False, conf=0.10)
                     
                     if len(results[0].boxes) > 0:
                         raw_dets = []
@@ -356,13 +359,21 @@ if btn_run and arquivos_prontos:
                                 has_purple = np.any((roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128))
                                 has_green = np.any((roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0))
                                 
-                                # CÁLCULO DE SOLIDEZ (Área da Máscara / Área do Bounding Box)
+                                # CÁLCULO DE SOLIDEZ E ÁREA (Área da Máscara / Área do Bounding Box)
                                 bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
                                 polygon_area = np.sum(d['mask'])
                                 solidity = polygon_area / bbox_area if bbox_area > 0 else 0
                                 
-                                # Condição: Tem as duas cores AND preenche pelo menos 30% da caixa
-                                if has_purple and has_green and solidity >= 0.30:
+                                # ==========================================================
+                                # ⚠️ AJUSTE 2: Área Mínima Absoluta Maior
+                                # Introduzida a trava de 150 pixels de área mínima da caixa.
+                                # Isso mata ruídos minúsculos e esparsos que a rede sugeriu
+                                # devido à redução da confiança (Resolve as Imagens 1 e 3)
+                                # ==========================================================
+                                AREA_MINIMA_BBOX = 150 
+                                
+                                # Condição: Tem as duas cores AND preenche pelo menos 30% da caixa AND Caixa > 150 px
+                                if has_purple and has_green and solidity >= 0.30 and bbox_area >= AREA_MINIMA_BBOX:
                                     furos_pre_aprovados.append(d)
                             else:
                                 furos_pre_aprovados.append(d) # Preserva outras classes
