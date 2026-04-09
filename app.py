@@ -289,10 +289,7 @@ if btn_run and arquivos_prontos:
                     img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
                     
-                    # ==========================================================
-                    # ⚠️ AJUSTE 1: Limiar de Confiança Menor
-                    # Reduzido de 0.15 para 0.10 para pescar furos tênues (Imagem 2)
-                    # ==========================================================
+                    # Limiar de Confiança Menor = 0.10
                     results = model.predict(img_clean, verbose=False, conf=0.10)
                     
                     if len(results[0].boxes) > 0:
@@ -359,24 +356,18 @@ if btn_run and arquivos_prontos:
                                 has_purple = np.any((roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128))
                                 has_green = np.any((roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0))
                                 
-                                # CÁLCULO DE SOLIDEZ E ÁREA (Área da Máscara / Área do Bounding Box)
+                                # CÁLCULO DE SOLIDEZ E ÁREA
                                 bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
                                 polygon_area = np.sum(d['mask'])
                                 solidity = polygon_area / bbox_area if bbox_area > 0 else 0
                                 
-                                # ==========================================================
-                                # ⚠️ AJUSTE 2: Área Mínima Absoluta Maior
-                                # Introduzida a trava de 150 pixels de área mínima da caixa.
-                                # Isso mata ruídos minúsculos e esparsos que a rede sugeriu
-                                # devido à redução da confiança (Resolve as Imagens 1 e 3)
-                                # ==========================================================
-                                AREA_MINIMA_BBOX = 450 
+                                # Área Mínima Absoluta de 150 px
+                                AREA_MINIMA_BBOX = 150 
                                 
-                                # Condição: Tem as duas cores AND preenche pelo menos 30% da caixa AND Caixa > 150 px
                                 if has_purple and has_green and solidity >= 0.30 and bbox_area >= AREA_MINIMA_BBOX:
                                     furos_pre_aprovados.append(d)
                             else:
-                                furos_pre_aprovados.append(d) # Preserva outras classes
+                                furos_pre_aprovados.append(d) 
 
                         # 2B. Cálculo da Área Média Pura e Filtro Final
                         furos_validos = [d for d in furos_pre_aprovados if d['cls_nome'].lower() == 'furo']
@@ -397,7 +388,6 @@ if btn_run and arquivos_prontos:
                             avg_area = np.mean(clean_areas) if len(clean_areas) > 0 else np.mean(areas)
                             avg_asp = np.mean(clean_aspects) if len(clean_aspects) > 0 else np.mean(aspects)
                             
-                            # Margem expandida para 70% da área média limpa
                             margem_area = avg_area * 0.70 
                             margem_asp = avg_asp * 0.70
 
@@ -410,7 +400,7 @@ if btn_run and arquivos_prontos:
                                     d_aspect = (x2 - x1) / max(1, y2 - y1)
                                     
                                     if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
-                                        continue # Descarta furos que fogem muito da média real
+                                        continue 
                                         
                             final_dets.append(d)
 
@@ -420,8 +410,10 @@ if btn_run and arquivos_prontos:
                             for local_id, d in enumerate(final_dets, 1):
                                 x1, y1, x2, y2 = d['box']
                                 
+                                # ⚠️ AJUSTE DA TABELA 1: Calculando a área da caixa (px) para salvar
+                                area_caixa = max(1, x2 - x1) * max(1, y2 - y1)
+                                
                                 cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
-                                # Texto em preto para garantir leitura no fundo branco do B-Scan
                                 cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                 
                                 color_contour = (255, 255, 0) if d['cls_nome'].lower() == 'furo' else (0, 255, 255)
@@ -443,6 +435,7 @@ if btn_run and arquivos_prontos:
                                     'Coordenada ODO(mm)': int(center_x_mm),
                                     'Coordenada Depth(mm)': int(center_y_mm),
                                     'Comprimento(mm)': comprimento,
+                                    'Área (px)': int(area_caixa), # ⚠️ ADICIONADO AQUI
                                     'Confiança': f"{d['conf']:.2%}", 
                                     'Aprovado': True,
                                     'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w_img:.6f} {((y1+y2)/2)/h_img:.6f} {(x2-x1)/w_img:.6f} {(y2-y1)/h_img:.6f}"
@@ -613,14 +606,15 @@ if st.session_state.deteccoes or st.session_state.img_gallery:
                     df_imagem_atual = df_raw[mask].copy()
                     
                     if not df_imagem_atual.empty:
+                        # ⚠️ AJUSTE DA TABELA 2: Coluna 'Área (px)' injetada na visualização e nas travas do editor
                         edited_df = st.data_editor(
-                            df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
+                            df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
                             column_config={
                                 "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
                                 "ID_Global": None, 
                                 "ID_Img": st.column_config.TextColumn("Ref")
                             },
-                            disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Confiança', 'Comprimento(mm)'], 
+                            disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Comprimento(mm)'], 
                             hide_index=True,
                             use_container_width=True,
                             key=f"editor_img_{local_selecionado}_{img_idx}" 
