@@ -289,7 +289,8 @@ if btn_run and arquivos_prontos:
                     img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                     img_clean = img_base.copy()
                     
-                    results = model.predict(img_clean, verbose=False, conf=0.10)
+                    # ⚠️ Confiança baixada para 0.05 para garantir a detecção de furos fracos (como os relatados nas últimas imagens)
+                    results = model.predict(img_clean, verbose=False, conf=0.05)
                     
                     if len(results[0].boxes) > 0:
                         raw_dets = []
@@ -312,13 +313,13 @@ if btn_run and arquivos_prontos:
                                 'mask': mask_u8 > 0 
                             })
                         
-                        # Sort by confidence descending to ensure higher confidence dominates
+                        # Ordenar por confiança (decrescente) para garantir que a classe mais forte domine
                         raw_dets.sort(key=lambda x: x['conf'], reverse=True)
                         
                         # --- FASE 1: FUSÃO GEOMÉTRICA & SUPRESSÃO INTER-CLASSE ---
                         dets_mescladas = []
                         for d in raw_dets:
-                            bx1, duplicado_ou_suprimido = d['box'], False
+                            bx1, suprimido = d['box'], False
                             for f in dets_mescladas:
                                 bx2 = f['box']
                                 xl, yt = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
@@ -330,11 +331,9 @@ if btn_run and arquivos_prontos:
                                     limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.15
                                     
                                     if (area_inter / area_min) > limite_nms:
-                                        # ==========================================================
-                                        # ⚠️ AJUSTE 3: Impedir detecção de 2 classes no mesmo objeto.
-                                        # Se for a mesma classe: Funde as caixas e as máscaras.
-                                        # Se for classe diferente: A atual 'd' (que tem confiança menor) é suprimida/descartada.
-                                        # ==========================================================
+                                        # ⚠️ AJUSTE 3: Supressão multi-classe. 
+                                        # Se as classes forem iguais, mescla os BBoxes e as máscaras.
+                                        # Se forem diferentes, a classe atual (de menor confiança) é ignorada/suprimida em prol da dominante.
                                         if d['cls_id'] == f['cls_id']:
                                             f['box'][0] = min(bx1[0], bx2[0])
                                             f['box'][1] = min(bx1[1], bx2[1])
@@ -342,13 +341,17 @@ if btn_run and arquivos_prontos:
                                             f['box'][3] = max(bx1[3], bx2[3])
                                             f['mask'] = f['mask'] | d['mask']
                                         
-                                        duplicado_ou_suprimido = True
+                                        suprimido = True
                                         break
-                            if not duplicado_ou_suprimido: 
+                            if not suprimido: 
                                 dets_mescladas.append(d)
 
-                        # --- FASE 2: FILTROS HEURÍSTICOS ---
+                        # --- FASE 2: FILTROS HEURÍSTICOS (Nova Lógica V4 Injetada) ---
+                        
+                        # 2A. Filtro de Área Absoluta, Cor e Solidez
                         furos_pre_aprovados = []
+                        outras_deteccoes = []
+                        
                         for d in dets_mescladas:
                             cls_lower = d['cls_nome'].lower()
                             x1, y1, x2, y2 = d['box']
@@ -363,16 +366,18 @@ if btn_run and arquivos_prontos:
                             if cls_lower == 'furo':
                                 roi_bbox = img_clean[y1:y2, x1:x2]
                                 
+                                # EXIGE ROXO E VERDE
                                 has_purple = np.any((roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128))
                                 has_green = np.any((roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0))
                                 
                                 polygon_area = np.sum(d['mask'])
                                 solidity = polygon_area / bbox_area if bbox_area > 0 else 0
                                 
-                                if has_purple and has_green and solidity >= 0.30:
+                                # ⚠️ Solidez reduzida para 15% para permitir a aprovação de furos fracos/esburacados
+                                if has_purple and has_green and solidity >= 0.15:
                                     furos_pre_aprovados.append(d)
                             else:
-                                furos_pre_aprovados.append(d) 
+                                outras_deteccoes.append(d) 
 
                         # 2B. Cálculo da Área Média Pura (Apenas para furos válidos da etapa anterior)
                         furos_validos = [d for d in furos_pre_aprovados if d['cls_nome'].lower() == 'furo']
@@ -393,10 +398,12 @@ if btn_run and arquivos_prontos:
                             avg_area = np.mean(clean_areas) if len(clean_areas) > 0 else np.mean(areas)
                             avg_asp = np.mean(clean_aspects) if len(clean_aspects) > 0 else np.mean(aspects)
                             
-                            margem_area = avg_area * 0.70 
-                            margem_asp = avg_asp * 0.70
+                            # ⚠️ Tolerância aumentada para 90% para proteger furos reais com tamanhos variáveis
+                            margem_area = avg_area * 0.90 
+                            margem_asp = avg_asp * 0.90
 
-                        final_dets = []
+                        final_dets = outras_deteccoes.copy() # Trazemos as outras classes já filtradas
+                        
                         for d in furos_pre_aprovados:
                             if d['cls_nome'].lower() == 'furo':
                                 if len(furos_validos) > 2:
@@ -421,7 +428,6 @@ if btn_run and arquivos_prontos:
                                 
                                 # ==========================================================
                                 # ⚠️ AJUSTE 2: Desenho da Máscara foi completamente removido
-                                # As linhas de cv2.drawContours(...) foram suprimidas.
                                 # ==========================================================
                                 
                                 px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
