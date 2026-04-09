@@ -370,7 +370,7 @@ if btn_run and arquivos_prontos:
                                 # Isso mata ruídos minúsculos e esparsos que a rede sugeriu
                                 # devido à redução da confiança (Resolve as Imagens 1 e 3)
                                 # ==========================================================
-                                AREA_MINIMA_BBOX = 150 
+                                AREA_MINIMA_BBOX = 450 
                                 
                                 # Condição: Tem as duas cores AND preenche pelo menos 30% da caixa AND Caixa > 150 px
                                 if has_purple and has_green and solidity >= 0.30 and bbox_area >= AREA_MINIMA_BBOX:
