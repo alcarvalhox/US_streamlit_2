@@ -405,7 +405,9 @@ def main():
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     
                                     # ==============================================================
-                                    # ⚠️ NOVO CÁLCULO: LARGURA E ALTURA INDEPENDENTES EM MM REAIS
+                                    # ⚠️ LÓGICA RECORRIGIDA: 
+                                    # LARGURA = EIXO X (ODÔMETRO - 2400mm)
+                                    # ALTURA = EIXO Y (PROFUNDIDADE - GABARITO VARIÁVEL)
                                     # ==============================================================
                                     largura_mm = int(abs(px2 - px1) * 2400)
                                     altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
@@ -429,24 +431,20 @@ def main():
                                     })
                                 gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
         
-        progress_bar.progress(1.0, text="✅ Processamento concluído em todas as fatias de profundidade!")
+        progress_bar.progress(1.0, text="✅ Processamento concluído!")
         
         if found:
             st.session_state.deteccoes = found
             st.session_state.img_gallery = gallery
             st.rerun()
         else:
-            st.info("A inferência foi processada com sucesso, mas a rede neural não encontrou nenhum defeito nas imagens geradas.")
+            st.info("Nenhum defeito encontrado.")
 
     if st.session_state.deteccoes or st.session_state.img_gallery:
         st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
         
         df_raw = pd.DataFrame(st.session_state.deteccoes) if st.session_state.deteccoes else pd.DataFrame(columns=['Local', 'Aprovado', 'ID_Global', 'ID_Img'])
         
-        if not df_raw.empty and 'Local' not in df_raw.columns: df_raw['Local'] = "Alma" 
-        if not df_raw.empty and 'Aprovado' not in df_raw.columns: df_raw['Aprovado'] = True
-        if not df_raw.empty and 'ID_Global' not in df_raw.columns: df_raw['ID_Global'] = df_raw.index
-            
         st.markdown("<h4 style='color: #FFC600; text-align: center;'>Alternar Visualização de Tabelas e Modelos:</h4>", unsafe_allow_html=True)
         
         locais_fixos = ["Alma", "Boleto", "Patim", "🌐 Visão Global"]
@@ -455,204 +453,62 @@ def main():
         if local_selecionado == "🌐 Visão Global":
             aba_dados = st.tabs(["📊 Tabelas e Relatório Global"])[0]
             with aba_dados:
-                col_resumo, col_filtros = st.columns([1, 2])
                 df_aprovados_global = df_raw[df_raw['Aprovado'] == True].copy() if not df_raw.empty else pd.DataFrame()
-                
-                with col_resumo:
-                    st.markdown("##### 📈 Resumo Geral (Aprovados)")
-                    if not df_aprovados_global.empty:
-                        contagem_classes = df_aprovados_global['Classe'].value_counts().reset_index()
-                        contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
-                    else:
-                        st.info("Nenhum defeito aprovado na via toda.")
-                
-                with col_filtros:
-                    st.markdown("##### 🔍 Refinar Busca Global")
-                    cf1, cf2, cf3 = st.columns(3)
-                    with cf1:
-                        classes_disp = df_aprovados_global['Classe'].unique() if not df_aprovados_global.empty else []
-                        filtro_classe = st.multiselect("Classe:", options=classes_disp, default=classes_disp)
-                    with cf2:
-                        lados_disp = df_aprovados_global['Lado'].unique() if not df_aprovados_global.empty else []
-                        filtro_lado = st.multiselect("Lado:", options=lados_disp, default=lados_disp)
-                    with cf3:
-                        loc_disp = df_aprovados_global['Local'].unique() if not df_aprovados_global.empty else []
-                        filtro_local = st.multiselect("Local:", options=loc_disp, default=loc_disp)
-                        
                 if not df_aprovados_global.empty:
-                    df_filtrado_global = df_aprovados_global[
-                        (df_aprovados_global['Classe'].isin(filtro_classe)) & 
-                        (df_aprovados_global['Lado'].isin(filtro_lado)) &
-                        (df_aprovados_global['Local'].isin(filtro_local))
-                    ]
-                    
-                    colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
-                    df_final_export = df_filtrado_global.drop(columns=colunas_esconder, errors='ignore')
-                    
-                    st.markdown("<br>", unsafe_allow_html=True)
+                    df_final_export = df_aprovados_global.drop(columns=['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox'], errors='ignore')
                     st.dataframe(df_final_export, hide_index=True, use_container_width=True)
                     
-                    st.markdown("<hr>", unsafe_allow_html=True)
-                    col_down, _ = st.columns([1, 2])
-                    with col_down:
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            df_final_export.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
-                        excel_data = output.getvalue()
-                        
-                        st.download_button(
-                            label="📥 Baixar Relatório Unificado (Excel)", 
-                            data=excel_data, 
-                            file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                            type="primary"
-                        )
+                    output = io.BytesIO()
+                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                        df_final_export.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
+                    st.download_button(label="📥 Baixar Relatório (Excel)", data=output.getvalue(), file_name="relatorio_us.xlsx", use_container_width=True)
         else:
             df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy() if not df_raw.empty else pd.DataFrame()
             galeria_local_atual = [item for item in st.session_state.img_gallery if item.get('local') == local_selecionado]
             
-            if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
-            if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
-            
-            colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
-            df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore') if not df_local_atual.empty else pd.DataFrame()
-            
             aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
             
-            with aba_dados:
-                col_resumo, col_filtros = st.columns([1, 2])
-                with col_resumo:
-                    st.markdown(f"##### 📈 Resumo - {local_selecionado} (Aprovados)")
-                    if not df_aprovados_local.empty:
-                        contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
-                        contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
-                    else:
-                        st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
-                    
-                with col_filtros:
-                    st.markdown("##### 🔍 Refinar Busca")
-                    cf1, cf2 = st.columns(2)
-                    with cf1:
-                        classes_disp = df_aprovados_local['Classe'].unique() if not df_aprovados_local.empty else []
-                        filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disp, default=classes_disp)
-                    with cf2:
-                        lados_disp = df_aprovados_local['Lado'].unique() if not df_aprovados_local.empty else []
-                        filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disp, default=lados_disp)
-                        
-                if not df_aprovados_local.empty:
-                    df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
-
             with aba_auditoria:
                 total_imagens_det = len(galeria_local_atual)
                 if total_imagens_det > 0:
+                    img_idx = st.session_state.audit_idx[local_selecionado]
+                    if img_idx >= total_imagens_det: img_idx = 0
+                    
                     col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
                     with col_nav_esq:
-                        if st.session_state.audit_idx[local_selecionado] > 0:
-                            if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_prev"):
-                                st.session_state.audit_idx[local_selecionado] -= 1
-                                st.rerun()
+                        if st.button("⬅️ Anterior", key=f"prev_{local_selecionado}"): 
+                            st.session_state.audit_idx[local_selecionado] = max(0, img_idx - 1)
+                            st.rerun()
                     with col_nav_centro:
-                        st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx[local_selecionado] + 1} de {total_imagens_det} ({local_selecionado})</h5>", unsafe_allow_html=True)
+                        st.markdown(f"<h5 style='text-align: center; color: white;'>Imagem {img_idx + 1} de {total_imagens_det}</h5>", unsafe_allow_html=True)
                     with col_nav_dir:
-                        if st.session_state.audit_idx[local_selecionado] < total_imagens_det - 1:
-                            if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_next"):
-                                st.session_state.audit_idx[local_selecionado] += 1
-                                st.rerun()
+                        if st.button("Próxima ➡️", key=f"next_{local_selecionado}"):
+                            st.session_state.audit_idx[local_selecionado] = min(total_imagens_det - 1, img_idx + 1)
+                            st.rerun()
                     
-                    img_idx = st.session_state.audit_idx[local_selecionado]
                     img_atual = galeria_local_atual[img_idx]
-                    
-                    st.markdown("<br>", unsafe_allow_html=True) 
-                    col_esq, col_dir = st.columns([3, 2])
-                    
-                    with col_esq:
+                    col_img, col_tab = st.columns([3, 2])
+                    with col_img:
                         st.image(img_atual['img'], channels="BGR", use_container_width=True)
-                        st.caption(f"Visualizando: {img_atual['label']}")
-                        
-                    with col_dir:
-                        st.markdown("#### Validar Detecções")
+                    with col_tab:
                         mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado']) & (df_raw['Local'] == local_selecionado)
                         df_imagem_atual = df_raw[mask].copy()
-                        
                         if not df_imagem_atual.empty:
-                            # ⚠️ NOVO AJUSTE: Tabela renderizando Largura(mm) e Altura(mm)
                             edited_df = st.data_editor(
-                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
-                                column_config={
-                                    "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
-                                    "ID_Global": None, 
-                                    "ID_Img": st.column_config.TextColumn("Ref")
-                                },
-                                disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
-                                hide_index=True,
-                                use_container_width=True,
-                                key=f"editor_img_{local_selecionado}_{img_idx}" 
+                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
+                                column_config={"Aprovado": st.column_config.CheckboxColumn("Aprovar", default=True), "ID_Global": None},
+                                disabled=['ID_Img', 'Classe', 'Largura(mm)', 'Altura(mm)'], 
+                                hide_index=True, use_container_width=True, key=f"edit_{local_selecionado}_{img_idx}"
                             )
-                            
                             for _, row in edited_df.iterrows():
-                                g_id = int(row['ID_Global'])
-                                if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
-                                    st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
-                                    st.rerun() 
-                        else:
-                            st.info("Esta imagem não possui detecções ativas. Serve como negative mining no retreinamento.")
-                    
-                    st.markdown("<br><hr>", unsafe_allow_html=True)
-                    st.markdown("#### 📦 Exportar Dataset Estruturado para Retreinamento")
-                    
-                    if 'img_clean' in st.session_state.img_gallery[0]:
-                        st.download_button(
-                            label="⬇️ Baixar Dataset Global Estruturado",
-                            data=gerar_zip_dataset(),
-                            file_name=f"dataset_multi_retreino_{datetime.now().strftime('%d%m%H%M')}.zip",
-                            mime="application/zip",
-                            use_container_width=False
-                        )
-                else:
-                    if local_selecionado == "Patim":
-                        st.info("⚠️ O modelo do Patim não está carregado ou os arquivos não possuem dados dessa região.")
-                    else:
-                        st.info(f"Nenhuma imagem correspondente a {local_selecionado} para auditar.")
-
+                                st.session_state.deteccoes[int(row['ID_Global'])]['Aprovado'] = row['Aprovado']
+            
             with aba_galeria:
-                st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão para tela cheia.")
-                itens_por_pagina = 20
-                total_paginas = max(1, (len(galeria_local_atual) - 1) // itens_por_pagina + 1) if len(galeria_local_atual) > 0 else 1
-                
-                if st.session_state.page[local_selecionado] >= total_paginas:
-                    st.session_state.page[local_selecionado] = 0
-                    
-                inicio_idx = st.session_state.page[local_selecionado] * itens_por_pagina
-                fim_idx = inicio_idx + itens_por_pagina
-                imagens_atuais = galeria_local_atual[inicio_idx:fim_idx]
-                
-                cols = st.columns(3) 
-                for idx, item in enumerate(imagens_atuais):
+                cols = st.columns(3)
+                for idx, item in enumerate(galeria_local_atual):
                     with cols[idx % 3]:
                         st.image(item['img'], channels="BGR", use_container_width=True)
-                        odo_val = item['label'].split('@')[1].strip()
-                        st.markdown(f"<div style='text-align: center; color: #FFC600; font-weight: bold; margin-top: -10px; margin-bottom: 15px;'>ODO: {odo_val}</div>", unsafe_allow_html=True)
-                
-                if total_paginas > 1:
-                    st.write("") 
-                    col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
-                    with col_pg_esq:
-                        if st.session_state.page[local_selecionado] > 0:
-                            if st.button("⬅️ Anterior", use_container_width=True, key="pg_gal_prev"):
-                                st.session_state.page[local_selecionado] -= 1
-                                st.rerun()
-                    with col_pg_centro:
-                        st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
-                    with col_pg_dir:
-                        if st.session_state.page[local_selecionado] < total_paginas - 1:
-                            if st.button("Próxima ➡️", use_container_width=True, key="pg_gal_next"):
-                                st.session_state.page[local_selecionado] += 1
-                                st.rerun()
+                        st.caption(item['label'])
 
 # =====================================================================
 # 3. GATILHO DE EXECUÇÃO PRINCIPAL
