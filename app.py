@@ -112,6 +112,7 @@ def load_ov_model(nome_pt):
     return YOLO(path_ov, task='segment') 
 
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome):
+    # Imagem mantida fisicamente acurada apenas para o YOLO analisar perfeitamente
     resize_por_secao = {'Boleto': 2, 'Alma': 2, 'Patim': 3}
     k = resize_por_secao.get(local_nome, 1)
     
@@ -427,23 +428,36 @@ def main():
                             for d in furos_pre_aprovados:
                                 if d['cls_nome'].lower() == 'furo':
                                     if len(furos_validos) > 2:
-                                        x1, y1, x2, y2 = d['box']
-                                        d_area = (x2 - x1) * max(1, y2 - y1)
-                                        d_aspect = (x2 - x1) / max(1, y2 - y1)
+                                        x1_box, y1_box, x2_box, y2_box = d['box']
+                                        d_area = (x2_box - x1_box) * max(1, y2_box - y1_box)
+                                        d_aspect = (x2_box - x1_box) / max(1, y2_box - y1_box)
                                         if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
                                             continue 
                                 final_dets.append(d)
 
+                            # ==============================================================
+                            # ⚠️ NOVO AJUSTE: RESTAURANDO O TAMANHO VISUAL CLÁSSICO (1500x500)
+                            # ==============================================================
                             if final_dets:
-                                img_draw = img_clean.copy()
+                                VIS_W, VIS_H = 1500, 500
+                                # Redimensionamos primeiro, para que o texto e as caixas não fiquem esticados
+                                img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
+                                img_clean_export = img_draw.copy() 
+                                
                                 for local_id, d in enumerate(final_dets, 1):
-                                    x1, y1, x2, y2 = d['box']
-                                    area_caixa = max(1, x2 - x1) * max(1, y2 - y1)
+                                    x1_orig, y1_orig, x2_orig, y2_orig = d['box']
+                                    area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
+                                    
+                                    # Mapear coordenadas originais para a imagem de 1500x500
+                                    x1 = int((x1_orig / w_img) * VIS_W)
+                                    y1 = int((y1_orig / h_img) * VIS_H)
+                                    x2 = int((x2_orig / w_img) * VIS_W)
+                                    y2 = int((y2_orig / h_img) * VIS_H)
                                     
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
-                                    cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, y1-7), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+                                    cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
-                                    px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
+                                    px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(delta_depth * py2) - int(delta_depth * py1))**2))
@@ -461,9 +475,10 @@ def main():
                                         'Área (px)': int(area_caixa),
                                         'Confiança': f"{d['conf']:.2%}", 
                                         'Aprovado': True,
-                                        'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w_img:.6f} {((y1+y2)/2)/h_img:.6f} {(x2-x1)/w_img:.6f} {(y2-y1)/h_img:.6f}"
+                                        # Como a nova imagem é redimensionada proporcionalmente (1500x500), as coordenadas relativas (YOLO) são mantidas perfeitamente
+                                        'yolo_bbox': f"{d['cls_id']} {((x1_orig+x2_orig)/2)/w_img:.6f} {((y1_orig+y2_orig)/2)/h_img:.6f} {(x2_orig-x1_orig)/w_img:.6f} {(y2_orig-y1_orig)/h_img:.6f}"
                                     })
-                                gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
+                                gallery.append({"img": img_draw, "img_clean": img_clean_export, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
         
         progress_bar.progress(1.0, text="✅ Processamento concluído em todas as fatias de profundidade!")
         
@@ -666,9 +681,10 @@ def main():
                 fim_idx = inicio_idx + itens_por_pagina
                 imagens_atuais = galeria_local_atual[inicio_idx:fim_idx]
                 
-                cols = st.columns(5)
+                # ⚠️ NOVO AJUSTE: Mudei para 3 colunas para as miniaturas ficarem muito maiores
+                cols = st.columns(3)
                 for idx, item in enumerate(imagens_atuais):
-                    with cols[idx % 5]:
+                    with cols[idx % 3]:
                         st.image(item['img'], channels="BGR", use_container_width=True)
                         odo_val = item['label'].split('@')[1].strip()
                         st.markdown(f"<div style='text-align: center; color: #FFC600; font-weight: bold; margin-top: -10px; margin-bottom: 15px;'>ODO: {odo_val}</div>", unsafe_allow_html=True)
