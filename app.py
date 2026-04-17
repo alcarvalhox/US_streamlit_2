@@ -1,14 +1,25 @@
 import subprocess
 import sys
 import os
+import tempfile
 import base64
 import warnings
 
 # =====================================================================
-# BLOQUEIO DE LOGS DO YOLO (Antes da importação)
+# BLOQUEIO DE LOGS, TELEMETRIA E "PHONE HOME" DO YOLO
+# (Deve ocorrer estritamente antes da importação da biblioteca)
 # =====================================================================
-os.environ['YOLO_CONFIG_DIR'] = '/tmp'  # Aponta para uma raiz genérica e garantida
-os.environ['YOLO_VERBOSE'] = 'False'    # Manda a biblioteca ficar quieta
+# 1. Cria a pasta fisicamente na área temporária antes do YOLO tentar
+TMP_DIR = tempfile.gettempdir()
+YOLO_CFG_DIR = os.path.join(TMP_DIR, 'Ultralytics_Config')
+os.makedirs(YOLO_CFG_DIR, exist_ok=True) 
+
+# 2. Injeta as chaves de isolamento offline no sistema
+os.environ['YOLO_CONFIG_DIR'] = YOLO_CFG_DIR
+os.environ['YOLO_VERBOSE'] = 'False'
+os.environ['YOLO_TELEMETRY'] = 'False'    # Desliga a telemetria (evita erro de conexão)
+os.environ['YOLO_UPDATE_CHECK'] = 'False' # Impede checagem de atualizações
+os.environ['YOLO_SYNC'] = 'False'         # Impede sincronização online
 
 # =====================================================================
 # 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
@@ -72,7 +83,7 @@ def load_yolo_model(nome_pt):
     path_pt = os.path.join(MODEL_DIR, nome_pt)
     
     if os.path.exists(path_pt):
-        # Desliga logs detalhados do modelo durante o carregamento
+        # Desliga logs detalhados do modelo durante a execução
         return YOLO(path_pt, task='segment', verbose=False)
     return None 
 
@@ -285,7 +296,6 @@ def main():
                         img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                         img_clean = img_base.copy()
                         
-                        # Executa em modo silencioso para não poluir o terminal
                         results = model.predict(img_clean, verbose=False, conf=0.05)
                         
                         if len(results[0].boxes) > 0:
