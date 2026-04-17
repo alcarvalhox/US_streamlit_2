@@ -12,7 +12,6 @@ def install_dependencies():
         try:
             if 'dependencies_installed' not in os.environ:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-                # Removido o scikit-learn para evitar problemas no Streamlit Cloud
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "scipy"])
                 os.environ['dependencies_installed'] = '1'
         except Exception as e:
@@ -58,7 +57,6 @@ def remover_pontos_isolados(df, raio=10):
     if df.empty: return df
     coords = df[['odo', 'depth']].values
     tree = cKDTree(coords)
-    # Voltamos para > 1 (>=2) para não matar o Boleto, que tem ecos mais curtos
     contagem = tree.query_ball_point(coords, r=raio, return_length=True)
     return df[contagem > 1].copy() 
 
@@ -78,11 +76,7 @@ def load_ov_model(nome_pt):
             return None 
     return YOLO(path_ov, task='segment') 
 
-# =====================================================================
-# ⚠️ CORREÇÃO DE ASPECT RATIO E ESPARSIDADE (1500x500 Fixo)
-# =====================================================================
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
-    # Fixado em 1500x500 para evitar achatamentos e respeitar o treinamento original
     width, height = 1500, 500
     img = np.full((height, width, 3), 255, dtype=np.uint8)
     probe_to_bgr = { 0: (0, 255, 255), 1: (0, 255, 255), 6: (0, 128, 0), 7: (0, 128, 0), 8: (128, 0, 128), 9: (128, 0, 128), 4: (0, 0, 255), 5: (0, 0, 255), 10: (255, 0, 0), 11: (255, 0, 0) }
@@ -97,8 +91,6 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    # ⚠️ Triângulo Anisotrópico: O segredo para não ter pontos espaçados
-    # size_x largo para fechar lacunas horizontais. size_y curto para manter a precisão de profundidade.
     size_x = 10
     size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
@@ -129,7 +121,7 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# 2. FUNÇÃO PRINCIPAL DA INTERFACE (BLINDAGEM STREAMLIT)
+# 2. FUNÇÃO PRINCIPAL DA INTERFACE
 # =====================================================================
 def main():
     st.set_page_config(
@@ -258,7 +250,7 @@ def main():
         df_raw = pd.concat([pd.read_csv(f) for f in files]).sort_values(by='odo')
         df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
         df_raw = df_raw[df_raw['level'] > 450]
-        df_raw = remover_pontos_isolados(df_raw) # Chama a função que já usa > 1
+        df_raw = remover_pontos_isolados(df_raw) 
         
         found = []
         gallery = []
@@ -287,8 +279,6 @@ def main():
                     
                     end = start + 2400
                     df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
-                    
-                    # Sem filtro RANSAC agressivo! Boleto respira novamente.
                     
                     if len(df_win) > 5:
                         img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
@@ -352,7 +342,6 @@ def main():
                                 x1, y1, x2, y2 = d['box']
                                 bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
                                 
-                                # Abrandamos o filtro de área para não matar detecções menores do Boleto
                                 if cls_lower in ['furo', 'bhc'] and bbox_area < 2900:
                                     continue 
                                 
@@ -405,16 +394,22 @@ def main():
                                 img_draw = img_clean.copy()
                                 
                                 for local_id, d in enumerate(final_dets, 1):
-                                    x1, y1, x2, y2 = d['box']
-                                    area_caixa = max(1, x2 - x1) * max(1, y2 - y1)
+                                    x1_orig, y1_orig, x2_orig, y2_orig = d['box']
+                                    area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
                                     
-                                    cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
-                                    cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+                                    cv2.rectangle(img_draw, (x1_orig, y1_orig), (x2_orig, y2_orig), (0,0,255), 2)
+                                    cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1_orig+2, max(15, y1_orig-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
-                                    px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
+                                    px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
-                                    comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(delta_depth * py2) - int(delta_depth * py1))**2))
+                                    
+                                    # ==============================================================
+                                    # ⚠️ NOVO CÁLCULO: LARGURA E ALTURA INDEPENDENTES EM MM REAIS
+                                    # ==============================================================
+                                    largura_mm = int(abs(px2 - px1) * 2400)
+                                    altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
+                                    altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                     
                                     found.append({
                                         'ID_Global': len(found), 
@@ -425,11 +420,12 @@ def main():
                                         'ODO_Ref': start,
                                         'Coordenada ODO(mm)': int(center_x_mm),
                                         'Coordenada Depth(mm)': int(center_y_mm),
-                                        'Comprimento(mm)': comprimento,
+                                        'Largura(mm)': largura_mm,
+                                        'Altura(mm)': altura_mm,
                                         'Área (px)': int(area_caixa),
                                         'Confiança': f"{d['conf']:.2%}", 
                                         'Aprovado': True,
-                                        'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w_img:.6f} {((y1+y2)/2)/h_img:.6f} {(x2-x1)/w_img:.6f} {(y2-y1)/h_img:.6f}"
+                                        'yolo_bbox': f"{d['cls_id']} {((x1_orig+x2_orig)/2)/w_img:.6f} {((y1_orig+y2_orig)/2)/h_img:.6f} {(x2_orig-x1_orig)/w_img:.6f} {(y2_orig-y1_orig)/h_img:.6f}"
                                     })
                                 gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
         
@@ -584,14 +580,15 @@ def main():
                         df_imagem_atual = df_raw[mask].copy()
                         
                         if not df_imagem_atual.empty:
+                            # ⚠️ NOVO AJUSTE: Tabela renderizando Largura(mm) e Altura(mm)
                             edited_df = st.data_editor(
-                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Comprimento(mm)', 'Aprovado']],
+                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
                                 column_config={
                                     "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
                                     "ID_Global": None, 
                                     "ID_Img": st.column_config.TextColumn("Ref")
                                 },
-                                disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Comprimento(mm)'], 
+                                disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
                                 hide_index=True,
                                 use_container_width=True,
                                 key=f"editor_img_{local_selecionado}_{img_idx}" 
@@ -634,7 +631,7 @@ def main():
                 fim_idx = inicio_idx + itens_por_pagina
                 imagens_atuais = galeria_local_atual[inicio_idx:fim_idx]
                 
-                cols = st.columns(3) # Mantido em 3 colunas para miniaturas grandes
+                cols = st.columns(3) 
                 for idx, item in enumerate(imagens_atuais):
                     with cols[idx % 3]:
                         st.image(item['img'], channels="BGR", use_container_width=True)
