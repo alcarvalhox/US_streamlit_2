@@ -4,8 +4,11 @@ import os
 import base64
 import warnings
 
-# Força o YOLO a usar a pasta temporária do servidor silenciosamente (Remove o WARNING)
-os.environ['YOLO_CONFIG_DIR'] = '/tmp/Ultralytics'
+# =====================================================================
+# BLOQUEIO DE LOGS DO YOLO (Antes da importação)
+# =====================================================================
+os.environ['YOLO_CONFIG_DIR'] = '/tmp'  # Aponta para uma raiz genérica e garantida
+os.environ['YOLO_VERBOSE'] = 'False'    # Manda a biblioteca ficar quieta
 
 # =====================================================================
 # 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
@@ -63,14 +66,14 @@ def remover_pontos_isolados(df, raio=15):
     contagem = tree.query_ball_point(coords, r=raio, return_length=True)
     return df[contagem > 1].copy() 
 
-# LEITURA ORIGINAL RESTAURADA: Sem OpenVINO, carrega direto o arquivo .pt
 @st.cache_resource
 def load_yolo_model(nome_pt):
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
     path_pt = os.path.join(MODEL_DIR, nome_pt)
     
     if os.path.exists(path_pt):
-        return YOLO(path_pt, task='segment')
+        # Desliga logs detalhados do modelo durante o carregamento
+        return YOLO(path_pt, task='segment', verbose=False)
     return None 
 
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
@@ -88,6 +91,7 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
+    # Marcador espesso original - Necessário para a IA reconhecer os Furos
     size_x = 10
     size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
@@ -212,7 +216,6 @@ def main():
 
     with col_botoes:
         st.markdown("<br>", unsafe_allow_html=True)
-        # Fix Streamlit UI Error (width='stretch' replaces use_container_width=True)
         btn_run = st.button("🚀 Iniciar Inferências", type="primary", width="stretch", disabled=not arquivos_prontos)
         
         if st.button("🧹 Limpar Caixa de Upload", width="stretch"):
@@ -235,7 +238,7 @@ def main():
         
         modelos_ativos = {}
         for local_nome, pt_file in CONFIG_MODELOS.items():
-            m = load_yolo_model(pt_file) # Carrega direto o .pt
+            m = load_yolo_model(pt_file) 
             if m: modelos_ativos[local_nome] = m
                 
         if not modelos_ativos:
@@ -282,6 +285,7 @@ def main():
                         img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                         img_clean = img_base.copy()
                         
+                        # Executa em modo silencioso para não poluir o terminal
                         results = model.predict(img_clean, verbose=False, conf=0.05)
                         
                         if len(results[0].boxes) > 0:
