@@ -76,8 +76,19 @@ def load_ov_model(nome_pt):
             return None 
     return YOLO(path_ov, task='segment') 
 
-def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
-    width, height = 1500, 500
+# LÓGICA RESTAURADA: Imagem gerada na proporção física real para a IA não ficar cega
+def generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome):
+    resize_por_secao = {'Boleto': 2, 'Alma': 2, 'Patim': 3}
+    k = resize_por_secao.get(local_nome, 1)
+
+    delta_depth = max_depth - min_depth
+    if delta_depth <= 0: delta_depth = 1 
+
+    BASE_WIDTH = 1200
+    width = int(BASE_WIDTH * k)
+    height = int((delta_depth * BASE_WIDTH) / 2400.0 * k)
+    height = max(height, 50) 
+    
     img = np.full((height, width, 3), 255, dtype=np.uint8)
     probe_to_bgr = { 0: (0, 255, 255), 1: (0, 255, 255), 6: (0, 128, 0), 7: (0, 128, 0), 8: (128, 0, 128), 9: (128, 0, 128), 4: (0, 0, 255), 5: (0, 0, 255), 10: (255, 0, 0), 11: (255, 0, 0) }
     
@@ -85,14 +96,11 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     depths = df_win['depth'].values
     probes = df_win['probe'].values
     
-    delta_depth = max_depth - min_depth
-    if delta_depth <= 0: delta_depth = 1 
-    
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    size_x = 10
-    size_y = 5
+    size_x = int(7 * k)
+    size_y = int(3.5 * k)
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
     
     for x, y, p in zip(x_coords, y_coords, probes):
@@ -281,7 +289,7 @@ def main():
                     df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
                     
                     if len(df_win) > 5:
-                        img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
+                        img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome)
                         img_clean = img_base.copy()
                         
                         results = model.predict(img_clean, verbose=False, conf=0.05)
@@ -390,25 +398,28 @@ def main():
                                             continue 
                                 final_dets.append(d)
 
+                            # LÓGICA DE EXIBIÇÃO: Redimensiona para o usuário apenas NA HORA DE MOSTRAR
                             if final_dets:
-                                img_draw = img_clean.copy()
+                                VIS_W, VIS_H = 1500, 500
+                                img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
                                 
                                 for local_id, d in enumerate(final_dets, 1):
                                     x1_orig, y1_orig, x2_orig, y2_orig = d['box']
                                     area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
                                     
-                                    cv2.rectangle(img_draw, (x1_orig, y1_orig), (x2_orig, y2_orig), (0,0,255), 2)
-                                    cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1_orig+2, max(15, y1_orig-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+                                    # Mapeia as coordenadas da caixa para o tamanho esticado 1500x500
+                                    x1 = int((x1_orig / w_img) * VIS_W)
+                                    y1 = int((y1_orig / h_img) * VIS_H)
+                                    x2 = int((x2_orig / w_img) * VIS_W)
+                                    y2 = int((y2_orig / h_img) * VIS_H)
+                                    
+                                    cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
+                                    cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
                                     px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     
-                                    # ==============================================================
-                                    # ⚠️ LÓGICA RECORRIGIDA: 
-                                    # LARGURA = EIXO X (ODÔMETRO - 2400mm)
-                                    # ALTURA = EIXO Y (PROFUNDIDADE - GABARITO VARIÁVEL)
-                                    # ==============================================================
                                     largura_mm = int(abs(px2 - px1) * 2400)
                                     altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
                                     altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
@@ -438,13 +449,18 @@ def main():
             st.session_state.img_gallery = gallery
             st.rerun()
         else:
-            st.info("Nenhum defeito encontrado.")
+            st.info("A inferência foi processada com sucesso, mas a rede neural não encontrou nenhum defeito nas imagens geradas.")
 
+    # A interface renderiza as tabelas APENAS se houver detecções no session_state
     if st.session_state.deteccoes or st.session_state.img_gallery:
         st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
         
         df_raw = pd.DataFrame(st.session_state.deteccoes) if st.session_state.deteccoes else pd.DataFrame(columns=['Local', 'Aprovado', 'ID_Global', 'ID_Img'])
         
+        if not df_raw.empty and 'Local' not in df_raw.columns: df_raw['Local'] = "Alma" 
+        if not df_raw.empty and 'Aprovado' not in df_raw.columns: df_raw['Aprovado'] = True
+        if not df_raw.empty and 'ID_Global' not in df_raw.columns: df_raw['ID_Global'] = df_raw.index
+            
         st.markdown("<h4 style='color: #FFC600; text-align: center;'>Alternar Visualização de Tabelas e Modelos:</h4>", unsafe_allow_html=True)
         
         locais_fixos = ["Alma", "Boleto", "Patim", "🌐 Visão Global"]
@@ -453,62 +469,203 @@ def main():
         if local_selecionado == "🌐 Visão Global":
             aba_dados = st.tabs(["📊 Tabelas e Relatório Global"])[0]
             with aba_dados:
+                col_resumo, col_filtros = st.columns([1, 2])
                 df_aprovados_global = df_raw[df_raw['Aprovado'] == True].copy() if not df_raw.empty else pd.DataFrame()
+                
+                with col_resumo:
+                    st.markdown("##### 📈 Resumo Geral (Aprovados)")
+                    if not df_aprovados_global.empty:
+                        contagem_classes = df_aprovados_global['Classe'].value_counts().reset_index()
+                        contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
+                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
+                    else:
+                        st.info("Nenhum defeito aprovado na via toda.")
+                
+                with col_filtros:
+                    st.markdown("##### 🔍 Refinar Busca Global")
+                    cf1, cf2, cf3 = st.columns(3)
+                    with cf1:
+                        classes_disp = df_aprovados_global['Classe'].unique() if not df_aprovados_global.empty else []
+                        filtro_classe = st.multiselect("Classe:", options=classes_disp, default=classes_disp)
+                    with cf2:
+                        lados_disp = df_aprovados_global['Lado'].unique() if not df_aprovados_global.empty else []
+                        filtro_lado = st.multiselect("Lado:", options=lados_disp, default=lados_disp)
+                    with cf3:
+                        loc_disp = df_aprovados_global['Local'].unique() if not df_aprovados_global.empty else []
+                        filtro_local = st.multiselect("Local:", options=loc_disp, default=loc_disp)
+                        
                 if not df_aprovados_global.empty:
-                    df_final_export = df_aprovados_global.drop(columns=['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox'], errors='ignore')
+                    df_filtrado_global = df_aprovados_global[
+                        (df_aprovados_global['Classe'].isin(filtro_classe)) & 
+                        (df_aprovados_global['Lado'].isin(filtro_lado)) &
+                        (df_aprovados_global['Local'].isin(filtro_local))
+                    ]
+                    
+                    colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
+                    df_final_export = df_filtrado_global.drop(columns=colunas_esconder, errors='ignore')
+                    
+                    st.markdown("<br>", unsafe_allow_html=True)
                     st.dataframe(df_final_export, hide_index=True, use_container_width=True)
                     
-                    output = io.BytesIO()
-                    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                        df_final_export.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
-                    st.download_button(label="📥 Baixar Relatório (Excel)", data=output.getvalue(), file_name="relatorio_us.xlsx", use_container_width=True)
+                    st.markdown("<hr>", unsafe_allow_html=True)
+                    col_down, _ = st.columns([1, 2])
+                    with col_down:
+                        output = io.BytesIO()
+                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                            df_final_export.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
+                        excel_data = output.getvalue()
+                        
+                        st.download_button(
+                            label="📥 Baixar Relatório Unificado (Excel)", 
+                            data=excel_data, 
+                            file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            type="primary"
+                        )
         else:
             df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy() if not df_raw.empty else pd.DataFrame()
             galeria_local_atual = [item for item in st.session_state.img_gallery if item.get('local') == local_selecionado]
             
+            if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
+            if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
+            
+            colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
+            df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore') if not df_local_atual.empty else pd.DataFrame()
+            
             aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
             
+            with aba_dados:
+                col_resumo, col_filtros = st.columns([1, 2])
+                with col_resumo:
+                    st.markdown(f"##### 📈 Resumo - {local_selecionado} (Aprovados)")
+                    if not df_aprovados_local.empty:
+                        contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
+                        contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
+                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
+                    else:
+                        st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
+                    
+                with col_filtros:
+                    st.markdown("##### 🔍 Refinar Busca")
+                    cf1, cf2 = st.columns(2)
+                    with cf1:
+                        classes_disp = df_aprovados_local['Classe'].unique() if not df_aprovados_local.empty else []
+                        filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disp, default=classes_disp)
+                    with cf2:
+                        lados_disp = df_aprovados_local['Lado'].unique() if not df_aprovados_local.empty else []
+                        filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disp, default=lados_disp)
+                        
+                if not df_aprovados_local.empty:
+                    df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
+
             with aba_auditoria:
                 total_imagens_det = len(galeria_local_atual)
                 if total_imagens_det > 0:
-                    img_idx = st.session_state.audit_idx[local_selecionado]
-                    if img_idx >= total_imagens_det: img_idx = 0
-                    
                     col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
                     with col_nav_esq:
-                        if st.button("⬅️ Anterior", key=f"prev_{local_selecionado}"): 
-                            st.session_state.audit_idx[local_selecionado] = max(0, img_idx - 1)
-                            st.rerun()
+                        if st.session_state.audit_idx[local_selecionado] > 0:
+                            if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_prev"):
+                                st.session_state.audit_idx[local_selecionado] -= 1
+                                st.rerun()
                     with col_nav_centro:
-                        st.markdown(f"<h5 style='text-align: center; color: white;'>Imagem {img_idx + 1} de {total_imagens_det}</h5>", unsafe_allow_html=True)
+                        st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx[local_selecionado] + 1} de {total_imagens_det} ({local_selecionado})</h5>", unsafe_allow_html=True)
                     with col_nav_dir:
-                        if st.button("Próxima ➡️", key=f"next_{local_selecionado}"):
-                            st.session_state.audit_idx[local_selecionado] = min(total_imagens_det - 1, img_idx + 1)
-                            st.rerun()
+                        if st.session_state.audit_idx[local_selecionado] < total_imagens_det - 1:
+                            if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_next"):
+                                st.session_state.audit_idx[local_selecionado] += 1
+                                st.rerun()
                     
+                    img_idx = st.session_state.audit_idx[local_selecionado]
                     img_atual = galeria_local_atual[img_idx]
-                    col_img, col_tab = st.columns([3, 2])
-                    with col_img:
+                    
+                    st.markdown("<br>", unsafe_allow_html=True) 
+                    col_esq, col_dir = st.columns([3, 2])
+                    
+                    with col_esq:
                         st.image(img_atual['img'], channels="BGR", use_container_width=True)
-                    with col_tab:
+                        st.caption(f"Visualizando: {img_atual['label']}")
+                        
+                    with col_dir:
+                        st.markdown("#### Validar Detecções")
                         mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado']) & (df_raw['Local'] == local_selecionado)
                         df_imagem_atual = df_raw[mask].copy()
+                        
                         if not df_imagem_atual.empty:
                             edited_df = st.data_editor(
-                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
-                                column_config={"Aprovado": st.column_config.CheckboxColumn("Aprovar", default=True), "ID_Global": None},
-                                disabled=['ID_Img', 'Classe', 'Largura(mm)', 'Altura(mm)'], 
-                                hide_index=True, use_container_width=True, key=f"edit_{local_selecionado}_{img_idx}"
+                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
+                                column_config={
+                                    "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
+                                    "ID_Global": None, 
+                                    "ID_Img": st.column_config.TextColumn("Ref")
+                                },
+                                disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
+                                hide_index=True,
+                                use_container_width=True,
+                                key=f"editor_img_{local_selecionado}_{img_idx}" 
                             )
+                            
                             for _, row in edited_df.iterrows():
-                                st.session_state.deteccoes[int(row['ID_Global'])]['Aprovado'] = row['Aprovado']
-            
+                                g_id = int(row['ID_Global'])
+                                if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
+                                    st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
+                                    st.rerun() 
+                        else:
+                            st.info("Esta imagem não possui detecções ativas. Serve como negative mining no retreinamento.")
+                    
+                    st.markdown("<br><hr>", unsafe_allow_html=True)
+                    st.markdown("#### 📦 Exportar Dataset Estruturado para Retreinamento")
+                    
+                    if 'img_clean' in st.session_state.img_gallery[0]:
+                        st.download_button(
+                            label="⬇️ Baixar Dataset Global Estruturado",
+                            data=gerar_zip_dataset(),
+                            file_name=f"dataset_multi_retreino_{datetime.now().strftime('%d%m%H%M')}.zip",
+                            mime="application/zip",
+                            use_container_width=False
+                        )
+                else:
+                    if local_selecionado == "Patim":
+                        st.info("⚠️ O modelo do Patim não está carregado ou os arquivos não possuem dados dessa região.")
+                    else:
+                        st.info(f"Nenhuma imagem correspondente a {local_selecionado} para auditar.")
+
             with aba_galeria:
-                cols = st.columns(3)
-                for idx, item in enumerate(galeria_local_atual):
+                st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão para tela cheia.")
+                itens_por_pagina = 20
+                total_paginas = max(1, (len(galeria_local_atual) - 1) // itens_por_pagina + 1) if len(galeria_local_atual) > 0 else 1
+                
+                if st.session_state.page[local_selecionado] >= total_paginas:
+                    st.session_state.page[local_selecionado] = 0
+                    
+                inicio_idx = st.session_state.page[local_selecionado] * itens_por_pagina
+                fim_idx = inicio_idx + itens_por_pagina
+                imagens_atuais = galeria_local_atual[inicio_idx:fim_idx]
+                
+                cols = st.columns(3) 
+                for idx, item in enumerate(imagens_atuais):
                     with cols[idx % 3]:
                         st.image(item['img'], channels="BGR", use_container_width=True)
-                        st.caption(item['label'])
+                        odo_val = item['label'].split('@')[1].strip()
+                        st.markdown(f"<div style='text-align: center; color: #FFC600; font-weight: bold; margin-top: -10px; margin-bottom: 15px;'>ODO: {odo_val}</div>", unsafe_allow_html=True)
+                
+                if total_paginas > 1:
+                    st.write("") 
+                    col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
+                    with col_pg_esq:
+                        if st.session_state.page[local_selecionado] > 0:
+                            if st.button("⬅️ Anterior", use_container_width=True, key="pg_gal_prev"):
+                                st.session_state.page[local_selecionado] -= 1
+                                st.rerun()
+                    with col_pg_centro:
+                        st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
+                    with col_pg_dir:
+                        if st.session_state.page[local_selecionado] < total_paginas - 1:
+                            if st.button("Próxima ➡️", use_container_width=True, key="pg_gal_next"):
+                                st.session_state.page[local_selecionado] += 1
+                                st.rerun()
 
 # =====================================================================
 # 3. GATILHO DE EXECUÇÃO PRINCIPAL
