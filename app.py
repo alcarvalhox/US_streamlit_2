@@ -4,6 +4,9 @@ import os
 import base64
 import warnings
 
+# Força o YOLO a usar a pasta temporária do servidor silenciosamente (Remove o WARNING)
+os.environ['YOLO_CONFIG_DIR'] = '/tmp/Ultralytics'
+
 # =====================================================================
 # 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
 # =====================================================================
@@ -60,23 +63,16 @@ def remover_pontos_isolados(df, raio=15):
     contagem = tree.query_ball_point(coords, r=raio, return_length=True)
     return df[contagem > 1].copy() 
 
+# LEITURA ORIGINAL RESTAURADA: Sem OpenVINO, carrega direto o arquivo .pt
 @st.cache_resource
-def load_ov_model(nome_pt):
+def load_yolo_model(nome_pt):
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
     path_pt = os.path.join(MODEL_DIR, nome_pt)
-    path_ov = os.path.join(MODEL_DIR, nome_pt.replace(".pt", "_openvino_model"))
     
-    if not os.path.exists(path_ov):
-        if os.path.exists(path_pt):
-            with st.status(f"Convertendo pesos do {nome_pt} para OpenVINO local...") as s:
-                model = YOLO(path_pt)
-                model.export(format="openvino", half=True)
-                s.update(label="Otimização Concluída!", state="complete")
-        else:
-            return None 
-    return YOLO(path_ov, task='segment') 
+    if os.path.exists(path_pt):
+        return YOLO(path_pt, task='segment')
+    return None 
 
-# LÓGICA RESTAURADA: Matriz 1500x500 e pincel GROSSO original (10x5) que o YOLO conhece
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     width, height = 1500, 500
     img = np.full((height, width, 3), 255, dtype=np.uint8)
@@ -92,7 +88,6 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    # RETORNO AO PINCEL ORIGINAL: Se mudar isso, o YOLO fica cego
     size_x = 10
     size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
@@ -217,13 +212,14 @@ def main():
 
     with col_botoes:
         st.markdown("<br>", unsafe_allow_html=True)
-        btn_run = st.button("🚀 Iniciar Inferências", type="primary", use_container_width=True, disabled=not arquivos_prontos)
+        # Fix Streamlit UI Error (width='stretch' replaces use_container_width=True)
+        btn_run = st.button("🚀 Iniciar Inferências", type="primary", width="stretch", disabled=not arquivos_prontos)
         
-        if st.button("🧹 Limpar Caixa de Upload", use_container_width=True):
+        if st.button("🧹 Limpar Caixa de Upload", width="stretch"):
             st.session_state.uploader_key += 1 
             st.rerun()
 
-        if st.button("🗑️ Resetar Sistema", use_container_width=True):
+        if st.button("🗑️ Resetar Sistema", width="stretch"):
             st.session_state.deteccoes = []
             st.session_state.img_gallery = []
             st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
@@ -239,7 +235,7 @@ def main():
         
         modelos_ativos = {}
         for local_nome, pt_file in CONFIG_MODELOS.items():
-            m = load_ov_model(pt_file)
+            m = load_yolo_model(pt_file) # Carrega direto o .pt
             if m: modelos_ativos[local_nome] = m
                 
         if not modelos_ativos:
@@ -339,7 +335,6 @@ def main():
                             final_dets = dets_mescladas
 
                             if final_dets:
-                                # AQUI ACONTECE A MÁGICA VISUAL: Estica a imagem apenas para exibir na tela
                                 VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
                                 
@@ -415,7 +410,7 @@ def main():
                     if not df_aprovados_global.empty:
                         contagem_classes = df_aprovados_global['Classe'].value_counts().reset_index()
                         contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
+                        st.dataframe(contagem_classes, hide_index=True)
                     else:
                         st.info("Nenhum defeito aprovado na via toda.")
                 
@@ -443,7 +438,7 @@ def main():
                     df_final_export = df_filtrado_global.drop(columns=colunas_esconder, errors='ignore')
                     
                     st.markdown("<br>", unsafe_allow_html=True)
-                    st.dataframe(df_final_export, hide_index=True, use_container_width=True)
+                    st.dataframe(df_final_export, hide_index=True)
                     
                     st.markdown("<hr>", unsafe_allow_html=True)
                     col_down, _ = st.columns([1, 2])
@@ -458,7 +453,7 @@ def main():
                             data=excel_data, 
                             file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
+                            width="stretch",
                             type="primary"
                         )
         else:
@@ -480,7 +475,7 @@ def main():
                     if not df_aprovados_local.empty:
                         contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
                         contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
+                        st.dataframe(contagem_classes, hide_index=True)
                     else:
                         st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
                     
@@ -497,7 +492,7 @@ def main():
                 if not df_aprovados_local.empty:
                     df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
                     st.markdown("<br>", unsafe_allow_html=True)
-                    st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
+                    st.dataframe(df_filtrado_local, hide_index=True)
 
             with aba_auditoria:
                 total_imagens_det = len(galeria_local_atual)
@@ -505,14 +500,14 @@ def main():
                     col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
                     with col_nav_esq:
                         if st.session_state.audit_idx[local_selecionado] > 0:
-                            if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_prev"):
+                            if st.button("⬅️ Imagem Anterior", width="stretch", key="btn_prev"):
                                 st.session_state.audit_idx[local_selecionado] -= 1
                                 st.rerun()
                     with col_nav_centro:
                         st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx[local_selecionado] + 1} de {total_imagens_det} ({local_selecionado})</h5>", unsafe_allow_html=True)
                     with col_nav_dir:
                         if st.session_state.audit_idx[local_selecionado] < total_imagens_det - 1:
-                            if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_next"):
+                            if st.button("Próxima Imagem ➡️", width="stretch", key="btn_next"):
                                 st.session_state.audit_idx[local_selecionado] += 1
                                 st.rerun()
                     
@@ -523,7 +518,7 @@ def main():
                     col_esq, col_dir = st.columns([3, 2])
                     
                     with col_esq:
-                        st.image(img_atual['img'], channels="BGR", use_container_width=True)
+                        st.image(img_atual['img'], channels="BGR")
                         st.caption(f"Visualizando: {img_atual['label']}")
                         
                     with col_dir:
@@ -541,7 +536,6 @@ def main():
                                 },
                                 disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
                                 hide_index=True,
-                                use_container_width=True,
                                 key=f"editor_img_{local_selecionado}_{img_idx}" 
                             )
                             
@@ -562,7 +556,7 @@ def main():
                             data=gerar_zip_dataset(),
                             file_name=f"dataset_multi_retreino_{datetime.now().strftime('%d%m%H%M')}.zip",
                             mime="application/zip",
-                            use_container_width=False
+                            width="content"
                         )
                 else:
                     if local_selecionado == "Patim":
@@ -585,7 +579,7 @@ def main():
                 cols = st.columns(3) 
                 for idx, item in enumerate(imagens_atuais):
                     with cols[idx % 3]:
-                        st.image(item['img'], channels="BGR", use_container_width=True)
+                        st.image(item['img'], channels="BGR")
                         odo_val = item['label'].split('@')[1].strip()
                         st.markdown(f"<div style='text-align: center; color: #FFC600; font-weight: bold; margin-top: -10px; margin-bottom: 15px;'>ODO: {odo_val}</div>", unsafe_allow_html=True)
                 
@@ -594,14 +588,14 @@ def main():
                     col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
                     with col_pg_esq:
                         if st.session_state.page[local_selecionado] > 0:
-                            if st.button("⬅️ Anterior", use_container_width=True, key="pg_gal_prev"):
+                            if st.button("⬅️ Anterior", width="stretch", key="pg_gal_prev"):
                                 st.session_state.page[local_selecionado] -= 1
                                 st.rerun()
                     with col_pg_centro:
                         st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
                     with col_pg_dir:
                         if st.session_state.page[local_selecionado] < total_paginas - 1:
-                            if st.button("Próxima ➡️", use_container_width=True, key="pg_gal_next"):
+                            if st.button("Próxima ➡️", width="stretch", key="pg_gal_next"):
                                 st.session_state.page[local_selecionado] += 1
                                 st.rerun()
 
