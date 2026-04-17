@@ -53,7 +53,7 @@ def load_image_b64(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
 
-def remover_pontos_isolados(df, raio=10):
+def remover_pontos_isolados(df, raio=15):
     if df.empty: return df
     coords = df[['odo', 'depth']].values
     tree = cKDTree(coords)
@@ -76,18 +76,9 @@ def load_ov_model(nome_pt):
             return None 
     return YOLO(path_ov, task='segment') 
 
-def generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome):
-    resize_por_secao = {'Boleto': 2, 'Alma': 2, 'Patim': 3}
-    k = resize_por_secao.get(local_nome, 1)
-
-    delta_depth = max_depth - min_depth
-    if delta_depth <= 0: delta_depth = 1 
-
-    BASE_WIDTH = 1200
-    width = int(BASE_WIDTH * k)
-    height = int((delta_depth * BASE_WIDTH) / 2400.0 * k)
-    height = max(height, 50) 
-    
+# LÓGICA RESTAURADA PARA A IA: Matriz rigorosamente em 1500x500 e pincel fino.
+def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
+    width, height = 1500, 500
     img = np.full((height, width, 3), 255, dtype=np.uint8)
     probe_to_bgr = { 0: (0, 255, 255), 1: (0, 255, 255), 6: (0, 128, 0), 7: (0, 128, 0), 8: (128, 0, 128), 9: (128, 0, 128), 4: (0, 0, 255), 5: (0, 0, 255), 10: (255, 0, 0), 11: (255, 0, 0) }
     
@@ -95,12 +86,15 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome):
     depths = df_win['depth'].values
     probes = df_win['probe'].values
     
+    delta_depth = max_depth - min_depth
+    if delta_depth <= 0: delta_depth = 1 
+    
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    size_x = int(7 * k)
-    size_y = int(3.5 * k)
-    base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
+    # Marcador fino (tamanho 3) para não desfigurar a anatomia original do defeito
+    size = 3
+    base_triangle = np.array([[0, -size], [-size, size], [size, size]], dtype=np.int32)
     
     for x, y, p in zip(x_coords, y_coords, probes):
         if 0 <= x < width and 0 <= y < height:
@@ -222,13 +216,13 @@ def main():
 
     with col_botoes:
         st.markdown("<br>", unsafe_allow_html=True)
-        btn_run = st.button("🚀 Iniciar Inferências", type="primary", width="stretch", disabled=not arquivos_prontos)
+        btn_run = st.button("🚀 Iniciar Inferências", type="primary", use_container_width=True, disabled=not arquivos_prontos)
         
-        if st.button("🧹 Limpar Caixa de Upload", width="stretch"):
+        if st.button("🧹 Limpar Caixa de Upload", use_container_width=True):
             st.session_state.uploader_key += 1 
             st.rerun()
 
-        if st.button("🗑️ Resetar Sistema", width="stretch"):
+        if st.button("🗑️ Resetar Sistema", use_container_width=True):
             st.session_state.deteccoes = []
             st.session_state.img_gallery = []
             st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
@@ -288,7 +282,8 @@ def main():
                     df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
                     
                     if len(df_win) > 5:
-                        img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome)
+                        # 1. GERAÇÃO CORRETA E CONHECIDA PELA IA
+                        img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                         img_clean = img_base.copy()
                         
                         results = model.predict(img_clean, verbose=False, conf=0.05)
@@ -327,7 +322,7 @@ def main():
                                     if xr > xl and yb > yt:
                                         area_inter = (xr-xl)*(yb-yt)
                                         area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
-                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.15
+                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.40 # Limite mais flexível
                                         
                                         if (area_inter / area_min) > limite_nms:
                                             if d['cls_id'] == f['cls_id']:
@@ -341,63 +336,11 @@ def main():
                                 if not suprimido: 
                                     dets_mescladas.append(d)
 
-                            furos_pre_aprovados = []
-                            outras_deteccoes = []
-                            
-                            for d in dets_mescladas:
-                                cls_lower = d['cls_nome'].lower()
-                                x1, y1, x2, y2 = d['box']
-                                bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
-                                
-                                if cls_lower in ['furo', 'bhc'] and bbox_area < 2900:
-                                    continue 
-                                
-                                if cls_lower == 'furo':
-                                    roi_bbox = img_clean[y1:y2, x1:x2]
-                                    has_purple = np.any((roi_bbox[:, :, 0] == 128) & (roi_bbox[:, :, 1] == 0) & (roi_bbox[:, :, 2] == 128))
-                                    has_green = np.any((roi_bbox[:, :, 0] == 0) & (roi_bbox[:, :, 1] == 128) & (roi_bbox[:, :, 2] == 0))
-                                    
-                                    polygon_area = np.sum(d['mask'])
-                                    solidity = polygon_area / bbox_area if bbox_area > 0 else 0
-                                    
-                                    if has_purple and has_green and solidity >= 0.15:
-                                        furos_pre_aprovados.append(d)
-                                else:
-                                    outras_deteccoes.append(d) 
-
-                            furos_validos = [d for d in furos_pre_aprovados if d['cls_nome'].lower() == 'furo']
-                            avg_area, avg_asp = 0, 0
-                            margem_area, margem_asp = 0, 0
-                            
-                            if len(furos_validos) > 2:
-                                areas = np.array([(d['box'][2]-d['box'][0]) * max(1, d['box'][3]-d['box'][1]) for d in furos_validos])
-                                aspects = np.array([(d['box'][2]-d['box'][0]) / max(1, d['box'][3]-d['box'][1]) for d in furos_validos])
-                                
-                                z_areas = np.abs((areas - np.mean(areas)) / (np.std(areas) + 1e-6))
-                                z_aspects = np.abs((aspects - np.mean(aspects)) / (np.std(aspects) + 1e-6))
-                                
-                                clean_areas = areas[z_areas < 1.5]
-                                clean_aspects = aspects[z_aspects < 1.5]
-                                
-                                avg_area = np.mean(clean_areas) if len(clean_areas) > 0 else np.mean(areas)
-                                avg_asp = np.mean(clean_aspects) if len(clean_aspects) > 0 else np.mean(aspects)
-                                
-                                margem_area = avg_area * 0.90 
-                                margem_asp = avg_asp * 0.90
-
-                            final_dets = outras_deteccoes.copy()
-                            
-                            for d in furos_pre_aprovados:
-                                if d['cls_nome'].lower() == 'furo':
-                                    if len(furos_validos) > 2:
-                                        x1_box, y1_box, x2_box, y2_box = d['box']
-                                        d_area = (x2_box - x1_box) * max(1, y2_box - y1_box)
-                                        d_aspect = (x2_box - x1_box) / max(1, y2_box - y1_box)
-                                        if abs(d_area - avg_area) > margem_area or abs(d_aspect - avg_asp) > margem_asp:
-                                            continue 
-                                final_dets.append(d)
+                            # 2. SEM FILTROS AGRESSIVOS (Confiança total na detecção do YOLO)
+                            final_dets = dets_mescladas
 
                             if final_dets:
+                                # 3. VISUALIZAÇÃO CONFORTÁVEL PARA O USUÁRIO (Larga e Não Achatada)
                                 VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
                                 
@@ -405,6 +348,7 @@ def main():
                                     x1_orig, y1_orig, x2_orig, y2_orig = d['box']
                                     area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
                                     
+                                    # Mapeamento milimétrico perfeito para o desenho alargado
                                     x1 = int((x1_orig / w_img) * VIS_W)
                                     y1 = int((y1_orig / h_img) * VIS_H)
                                     x2 = int((x2_orig / w_img) * VIS_W)
@@ -473,7 +417,7 @@ def main():
                     if not df_aprovados_global.empty:
                         contagem_classes = df_aprovados_global['Classe'].value_counts().reset_index()
                         contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True, width="stretch")
+                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
                     else:
                         st.info("Nenhum defeito aprovado na via toda.")
                 
@@ -501,7 +445,7 @@ def main():
                     df_final_export = df_filtrado_global.drop(columns=colunas_esconder, errors='ignore')
                     
                     st.markdown("<br>", unsafe_allow_html=True)
-                    st.dataframe(df_final_export, hide_index=True, width="stretch")
+                    st.dataframe(df_final_export, hide_index=True, use_container_width=True)
                     
                     st.markdown("<hr>", unsafe_allow_html=True)
                     col_down, _ = st.columns([1, 2])
@@ -516,7 +460,7 @@ def main():
                             data=excel_data, 
                             file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            width="stretch",
+                            use_container_width=True,
                             type="primary"
                         )
         else:
@@ -538,7 +482,7 @@ def main():
                     if not df_aprovados_local.empty:
                         contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
                         contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True, width="stretch")
+                        st.dataframe(contagem_classes, hide_index=True, use_container_width=True)
                     else:
                         st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
                     
@@ -555,7 +499,7 @@ def main():
                 if not df_aprovados_local.empty:
                     df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
                     st.markdown("<br>", unsafe_allow_html=True)
-                    st.dataframe(df_filtrado_local, hide_index=True, width="stretch")
+                    st.dataframe(df_filtrado_local, hide_index=True, use_container_width=True)
 
             with aba_auditoria:
                 total_imagens_det = len(galeria_local_atual)
@@ -563,14 +507,14 @@ def main():
                     col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
                     with col_nav_esq:
                         if st.session_state.audit_idx[local_selecionado] > 0:
-                            if st.button("⬅️ Imagem Anterior", width="stretch", key="btn_prev"):
+                            if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_prev"):
                                 st.session_state.audit_idx[local_selecionado] -= 1
                                 st.rerun()
                     with col_nav_centro:
                         st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx[local_selecionado] + 1} de {total_imagens_det} ({local_selecionado})</h5>", unsafe_allow_html=True)
                     with col_nav_dir:
                         if st.session_state.audit_idx[local_selecionado] < total_imagens_det - 1:
-                            if st.button("Próxima Imagem ➡️", width="stretch", key="btn_next"):
+                            if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_next"):
                                 st.session_state.audit_idx[local_selecionado] += 1
                                 st.rerun()
                     
@@ -581,7 +525,7 @@ def main():
                     col_esq, col_dir = st.columns([3, 2])
                     
                     with col_esq:
-                        st.image(img_atual['img'], channels="BGR", width="stretch")
+                        st.image(img_atual['img'], channels="BGR", use_container_width=True)
                         st.caption(f"Visualizando: {img_atual['label']}")
                         
                     with col_dir:
@@ -599,7 +543,7 @@ def main():
                                 },
                                 disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
                                 hide_index=True,
-                                width="stretch",
+                                use_container_width=True,
                                 key=f"editor_img_{local_selecionado}_{img_idx}" 
                             )
                             
@@ -620,7 +564,7 @@ def main():
                             data=gerar_zip_dataset(),
                             file_name=f"dataset_multi_retreino_{datetime.now().strftime('%d%m%H%M')}.zip",
                             mime="application/zip",
-                            width="content"
+                            use_container_width=False
                         )
                 else:
                     if local_selecionado == "Patim":
@@ -643,7 +587,7 @@ def main():
                 cols = st.columns(3) 
                 for idx, item in enumerate(imagens_atuais):
                     with cols[idx % 3]:
-                        st.image(item['img'], channels="BGR", width="stretch")
+                        st.image(item['img'], channels="BGR", use_container_width=True)
                         odo_val = item['label'].split('@')[1].strip()
                         st.markdown(f"<div style='text-align: center; color: #FFC600; font-weight: bold; margin-top: -10px; margin-bottom: 15px;'>ODO: {odo_val}</div>", unsafe_allow_html=True)
                 
@@ -652,14 +596,14 @@ def main():
                     col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
                     with col_pg_esq:
                         if st.session_state.page[local_selecionado] > 0:
-                            if st.button("⬅️ Anterior", width="stretch", key="pg_gal_prev"):
+                            if st.button("⬅️ Anterior", use_container_width=True, key="pg_gal_prev"):
                                 st.session_state.page[local_selecionado] -= 1
                                 st.rerun()
                     with col_pg_centro:
                         st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
                     with col_pg_dir:
                         if st.session_state.page[local_selecionado] < total_paginas - 1:
-                            if st.button("Próxima ➡️", width="stretch", key="pg_gal_next"):
+                            if st.button("Próxima ➡️", use_container_width=True, key="pg_gal_next"):
                                 st.session_state.page[local_selecionado] += 1
                                 st.rerun()
 
