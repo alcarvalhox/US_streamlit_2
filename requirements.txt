@@ -11,3 +11,4 @@ openpyxl
 streamlit
 pandas
 scikit-image
+scikit-learn
