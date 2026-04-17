@@ -398,16 +398,17 @@ def main():
                                             continue 
                                 final_dets.append(d)
 
-                            # LÓGICA DE EXIBIÇÃO: Redimensiona para o usuário apenas NA HORA DE MOSTRAR
+                            # LÓGICA DE EXIBIÇÃO: Redimensiona para o usuário com proporção Larga
                             if final_dets:
-                                VIS_W, VIS_H = 1500, 500
+                                # ⚠️ NOVO AJUSTE: Proporção muito mais larga (2400x400) para resolver o achatamento visual
+                                VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
                                 
                                 for local_id, d in enumerate(final_dets, 1):
                                     x1_orig, y1_orig, x2_orig, y2_orig = d['box']
                                     area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
                                     
-                                    # Mapeia as coordenadas da caixa para o tamanho esticado 1500x500
+                                    # Mapeia as coordenadas para o novo tamanho visual (mais largo)
                                     x1 = int((x1_orig / w_img) * VIS_W)
                                     y1 = int((y1_orig / h_img) * VIS_H)
                                     x2 = int((x2_orig / w_img) * VIS_W)
@@ -451,7 +452,6 @@ def main():
         else:
             st.info("A inferência foi processada com sucesso, mas a rede neural não encontrou nenhum defeito nas imagens geradas.")
 
-    # A interface renderiza as tabelas APENAS se houver detecções no session_state
     if st.session_state.deteccoes or st.session_state.img_gallery:
         st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
         
