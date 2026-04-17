@@ -76,7 +76,7 @@ def load_ov_model(nome_pt):
             return None 
     return YOLO(path_ov, task='segment') 
 
-# LÓGICA RESTAURADA PARA A IA: Matriz rigorosamente em 1500x500 e pincel fino.
+# LÓGICA RESTAURADA: Matriz 1500x500 e pincel GROSSO original (10x5) que o YOLO conhece
 def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     width, height = 1500, 500
     img = np.full((height, width, 3), 255, dtype=np.uint8)
@@ -92,9 +92,10 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    # Marcador fino (tamanho 3) para não desfigurar a anatomia original do defeito
-    size = 3
-    base_triangle = np.array([[0, -size], [-size, size], [size, size]], dtype=np.int32)
+    # RETORNO AO PINCEL ORIGINAL: Se mudar isso, o YOLO fica cego
+    size_x = 10
+    size_y = 5
+    base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
     
     for x, y, p in zip(x_coords, y_coords, probes):
         if 0 <= x < width and 0 <= y < height:
@@ -282,7 +283,6 @@ def main():
                     df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
                     
                     if len(df_win) > 5:
-                        # 1. GERAÇÃO CORRETA E CONHECIDA PELA IA
                         img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                         img_clean = img_base.copy()
                         
@@ -322,7 +322,7 @@ def main():
                                     if xr > xl and yb > yt:
                                         area_inter = (xr-xl)*(yb-yt)
                                         area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
-                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.40 # Limite mais flexível
+                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.40 
                                         
                                         if (area_inter / area_min) > limite_nms:
                                             if d['cls_id'] == f['cls_id']:
@@ -336,11 +336,10 @@ def main():
                                 if not suprimido: 
                                     dets_mescladas.append(d)
 
-                            # 2. SEM FILTROS AGRESSIVOS (Confiança total na detecção do YOLO)
                             final_dets = dets_mescladas
 
                             if final_dets:
-                                # 3. VISUALIZAÇÃO CONFORTÁVEL PARA O USUÁRIO (Larga e Não Achatada)
+                                # AQUI ACONTECE A MÁGICA VISUAL: Estica a imagem apenas para exibir na tela
                                 VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
                                 
@@ -348,7 +347,6 @@ def main():
                                     x1_orig, y1_orig, x2_orig, y2_orig = d['box']
                                     area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
                                     
-                                    # Mapeamento milimétrico perfeito para o desenho alargado
                                     x1 = int((x1_orig / w_img) * VIS_W)
                                     y1 = int((y1_orig / h_img) * VIS_H)
                                     x2 = int((x2_orig / w_img) * VIS_W)
