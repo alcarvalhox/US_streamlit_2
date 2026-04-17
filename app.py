@@ -12,12 +12,12 @@ def install_dependencies():
         try:
             if 'dependencies_installed' not in os.environ:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "scipy", "scikit-learn"])
+                # Removido o scikit-learn para evitar problemas no Streamlit Cloud
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "scipy"])
                 os.environ['dependencies_installed'] = '1'
         except Exception as e:
             print(f"Erro ao instalar dependências: {e}")
 
-# Proteção 1: Impede que subprocessos fiquem reinstalando dependências
 if __name__ == "__main__":
     install_dependencies()
 
@@ -30,9 +30,6 @@ import zipfile
 from ultralytics import YOLO
 from datetime import datetime
 from scipy.spatial import cKDTree
-from sklearn.linear_model import RANSACRegressor
-from sklearn.cluster import DBSCAN
-from sklearn.exceptions import UndefinedMetricWarning
 
 # =====================================================================
 # 1. CONFIGURAÇÕES GLOBAIS E FUNÇÕES BASE
@@ -61,39 +58,9 @@ def remover_pontos_isolados(df, raio=10):
     if df.empty: return df
     coords = df[['odo', 'depth']].values
     tree = cKDTree(coords)
+    # Voltamos para > 1 (>=2) para não matar o Boleto, que tem ecos mais curtos
     contagem = tree.query_ball_point(coords, r=raio, return_length=True)
-    return df[contagem >= 3].copy() 
-
-def aplicar_filtro_geometrico_ransac(df_interval):
-    if len(df_interval) <= 15:
-        return df_interval.copy()
-    try:
-        coords = df_interval[['odo', 'depth']].values
-        clustering = DBSCAN(eps=5, min_samples=3).fit(coords)
-        labels = clustering.labels_
-        indices_para_manter = []
-        
-        for label in set(labels):
-            if label == -1: continue 
-            idx_cluster = np.where(labels == label)[0]
-            cluster_df = df_interval.iloc[idx_cluster]
-            if len(cluster_df) < 5: continue
-
-            ransac = RANSACRegressor(residual_threshold=4.0, min_samples=5, random_state=42)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=UndefinedMetricWarning)
-                ransac.fit(cluster_df[['odo']].values, cluster_df['depth'].values)
-
-            slope = ransac.estimator_.coef_[0]
-            angle_deg = np.abs(np.degrees(np.arctan(slope)))
-            if 10 < angle_deg < 85:
-                indices_para_manter.extend(cluster_df.index[ransac.inlier_mask_].tolist())
-
-        if len(indices_para_manter) > 0:
-            return df_interval.loc[indices_para_manter].copy()
-        return df_interval.copy()
-    except Exception:
-        return df_interval.copy()
+    return df[contagem > 1].copy() 
 
 @st.cache_resource
 def load_ov_model(nome_pt):
@@ -111,19 +78,12 @@ def load_ov_model(nome_pt):
             return None 
     return YOLO(path_ov, task='segment') 
 
-def generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome):
-    # Imagem mantida fisicamente acurada apenas para o YOLO analisar perfeitamente
-    resize_por_secao = {'Boleto': 2, 'Alma': 2, 'Patim': 3}
-    k = resize_por_secao.get(local_nome, 1)
-    
-    delta_depth = max_depth - min_depth
-    if delta_depth <= 0: delta_depth = 1 
-    
-    BASE_WIDTH = 1200
-    width = int(BASE_WIDTH * k)
-    height = int((delta_depth * BASE_WIDTH) / 2400.0 * k)
-    height = max(height, 50)
-    
+# =====================================================================
+# ⚠️ CORREÇÃO DE ASPECT RATIO E ESPARSIDADE (1500x500 Fixo)
+# =====================================================================
+def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
+    # Fixado em 1500x500 para evitar achatamentos e respeitar o treinamento original
+    width, height = 1500, 500
     img = np.full((height, width, 3), 255, dtype=np.uint8)
     probe_to_bgr = { 0: (0, 255, 255), 1: (0, 255, 255), 6: (0, 128, 0), 7: (0, 128, 0), 8: (128, 0, 128), 9: (128, 0, 128), 4: (0, 0, 255), 5: (0, 0, 255), 10: (255, 0, 0), 11: (255, 0, 0) }
     
@@ -131,11 +91,16 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome):
     depths = df_win['depth'].values
     probes = df_win['probe'].values
     
+    delta_depth = max_depth - min_depth
+    if delta_depth <= 0: delta_depth = 1 
+    
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    size_x = int(7 * k) 
-    size_y = int(3.5 * k)
+    # ⚠️ Triângulo Anisotrópico: O segredo para não ter pontos espaçados
+    # size_x largo para fechar lacunas horizontais. size_y curto para manter a precisão de profundidade.
+    size_x = 10
+    size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
     
     for x, y, p in zip(x_coords, y_coords, probes):
@@ -293,7 +258,7 @@ def main():
         df_raw = pd.concat([pd.read_csv(f) for f in files]).sort_values(by='odo')
         df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
         df_raw = df_raw[df_raw['level'] > 450]
-        df_raw = remover_pontos_isolados(df_raw, raio=10)
+        df_raw = remover_pontos_isolados(df_raw) # Chama a função que já usa > 1
         
         found = []
         gallery = []
@@ -323,10 +288,10 @@ def main():
                     end = start + 2400
                     df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
                     
-                    df_win = aplicar_filtro_geometrico_ransac(df_win)
+                    # Sem filtro RANSAC agressivo! Boleto respira novamente.
                     
                     if len(df_win) > 5:
-                        img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth, local_nome)
+                        img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                         img_clean = img_base.copy()
                         
                         results = model.predict(img_clean, verbose=False, conf=0.05)
@@ -387,6 +352,7 @@ def main():
                                 x1, y1, x2, y2 = d['box']
                                 bbox_area = max(1, x2 - x1) * max(1, y2 - y1)
                                 
+                                # Abrandamos o filtro de área para não matar detecções menores do Boleto
                                 if cls_lower in ['furo', 'bhc'] and bbox_area < 2900:
                                     continue 
                                 
@@ -435,29 +401,17 @@ def main():
                                             continue 
                                 final_dets.append(d)
 
-                            # ==============================================================
-                            # ⚠️ NOVO AJUSTE: RESTAURANDO O TAMANHO VISUAL CLÁSSICO (1500x500)
-                            # ==============================================================
                             if final_dets:
-                                VIS_W, VIS_H = 1500, 500
-                                # Redimensionamos primeiro, para que o texto e as caixas não fiquem esticados
-                                img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
-                                img_clean_export = img_draw.copy() 
+                                img_draw = img_clean.copy()
                                 
                                 for local_id, d in enumerate(final_dets, 1):
-                                    x1_orig, y1_orig, x2_orig, y2_orig = d['box']
-                                    area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
-                                    
-                                    # Mapear coordenadas originais para a imagem de 1500x500
-                                    x1 = int((x1_orig / w_img) * VIS_W)
-                                    y1 = int((y1_orig / h_img) * VIS_H)
-                                    x2 = int((x2_orig / w_img) * VIS_W)
-                                    y2 = int((y2_orig / h_img) * VIS_H)
+                                    x1, y1, x2, y2 = d['box']
+                                    area_caixa = max(1, x2 - x1) * max(1, y2 - y1)
                                     
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
-                                    px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
+                                    px1, px2, py1, py2 = x1/w_img, x2/w_img, y1/h_img, y2/h_img
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     comprimento = int(np.sqrt((int(2400 * px2) - int(2400 * px1))**2 + (int(delta_depth * py2) - int(delta_depth * py1))**2))
@@ -475,10 +429,9 @@ def main():
                                         'Área (px)': int(area_caixa),
                                         'Confiança': f"{d['conf']:.2%}", 
                                         'Aprovado': True,
-                                        # Como a nova imagem é redimensionada proporcionalmente (1500x500), as coordenadas relativas (YOLO) são mantidas perfeitamente
-                                        'yolo_bbox': f"{d['cls_id']} {((x1_orig+x2_orig)/2)/w_img:.6f} {((y1_orig+y2_orig)/2)/h_img:.6f} {(x2_orig-x1_orig)/w_img:.6f} {(y2_orig-y1_orig)/h_img:.6f}"
+                                        'yolo_bbox': f"{d['cls_id']} {((x1+x2)/2)/w_img:.6f} {((y1+y2)/2)/h_img:.6f} {(x2-x1)/w_img:.6f} {(y2-y1)/h_img:.6f}"
                                     })
-                                gallery.append({"img": img_draw, "img_clean": img_clean_export, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
+                                gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
         
         progress_bar.progress(1.0, text="✅ Processamento concluído em todas as fatias de profundidade!")
         
@@ -681,8 +634,7 @@ def main():
                 fim_idx = inicio_idx + itens_por_pagina
                 imagens_atuais = galeria_local_atual[inicio_idx:fim_idx]
                 
-                # ⚠️ NOVO AJUSTE: Mudei para 3 colunas para as miniaturas ficarem muito maiores
-                cols = st.columns(3)
+                cols = st.columns(3) # Mantido em 3 colunas para miniaturas grandes
                 for idx, item in enumerate(imagens_atuais):
                     with cols[idx % 3]:
                         st.image(item['img'], channels="BGR", use_container_width=True)
