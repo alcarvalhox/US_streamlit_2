@@ -150,8 +150,6 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
 
     # 2. Operação Morfológica de Fechamento (Closing)
-    # Isso funde os pequenos triângulos de uma mesma reta em um único grande bloco (blob),
-    # eliminando a chance de achar retas falsas no serrilhado interno.
     kernel = np.ones((7, 7), np.uint8)
     mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
     mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
@@ -166,11 +164,9 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
 
     # 4. Função Interna Matemática: Avaliação de Paralelismo Físico
     def tem_paralelas_nao_colineares(contours, dist_minima_px=12.0):
-        # Se só tem 1 bloco (ou 0), é impossível ser paralela.
         if len(contours) < 2:
             return False
 
-        # Se tem 2 ou mais blocos, precisamos testar se estão lado-a-lado ou na mesma linha (quebrada)
         for i in range(len(contours)):
             for j in range(i + 1, len(contours)):
                 c1 = contours[i]
@@ -182,20 +178,25 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
 
                 if len(c1) >= 4:
                     # Traça a melhor reta que passa pelo meio do bloco 1
-                    [vx, vy, x0, y0] = cv2.fitLine(c1, cv2.DIST_L2, 0, 0.01, 0.01)
-                    vx, vy, x0, y0 = float(vx), float(vy), float(x0), float(y0)
+                    # CUIDADO: fitLine retorna um array 2D em algumas versões do OpenCV
+                    linha = cv2.fitLine(c1, cv2.DIST_L2, 0, 0.01, 0.01)
+                    
+                    # Correção do TypeError: Acessar explicitamente a posição [0] do array NumPy
+                    vx = float(linha[0][0])
+                    vy = float(linha[1][0])
+                    x0 = float(linha[2][0])
+                    y0 = float(linha[3][0])
 
                     # Encontra o "centro de gravidade" (centroide) do bloco 2
                     M = cv2.moments(c2)
                     if M['m00'] != 0:
-                        cx = M['m10'] / M['m00']
-                        cy = M['m01'] / M['m00']
+                        cx = float(M['m10'] / M['m00'])
+                        cy = float(M['m01'] / M['m00'])
                     else:
-                        cx, cy = float(c2[0][0][0]), float(c2[0][0][1])
+                        cx = float(c2[0][0][0])
+                        cy = float(c2[0][0][1])
 
                     # Calcula a distância perpendicular do centro do Bloco 2 até a reta do Bloco 1
-                    # Se for > 12 pixels, os blocos estão correndo lado a lado (BHC)
-                    # Se for < 12 pixels, o bloco 2 é apenas a continuação do bloco 1 (Furo Quebrado)
                     dist = abs(vy * (cx - x0) - vx * (cy - y0))
 
                     if dist >= dist_minima_px:
