@@ -128,89 +128,93 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO REESTRUTURADA: ANÁLISE TOPOLÓGICA (BLOBS) + COLINEARIDADE
+# FUNÇÃO REESTRUTURADA V3: ANÁLISE RIGOROSA DE PARALELISMO
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
-    Substitui a Transformada de Hough por Análise de Componentes Conexos (Blobs).
-    Resolve o problema do contorno serrilhado (falsos paralelos).
+    Exige que existam duas massas alongadas, com ângulos similares e espaçadas ortogonalmente.
     """
-    # 1. Filtro de Cores (Focado exatamente nos tons RGB do CSV gerador)
+    # 1. Filtro de Cores Ampliado (cobre variações leves no tom dos pixels do US)
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
-    upper_green = np.array([50, 150, 50], dtype=np.uint8)
+    upper_green = np.array([50, 255, 50], dtype=np.uint8)
     mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
 
     lower_purple = np.array([100, 0, 100], dtype=np.uint8)
-    upper_purple = np.array([150, 50, 150], dtype=np.uint8)
+    upper_purple = np.array([180, 50, 180], dtype=np.uint8)
     mask_roxa = cv2.inRange(roi_bgr, lower_purple, upper_purple)
 
-    # Aplica a máscara do YOLO para restringir a análise à peça detectada
     mask_yolo_u8 = (roi_mask_bool.astype(np.uint8) * 255)
     mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
     mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
 
-    # 2. Operação Morfológica de Fechamento (Closing)
-    kernel = np.ones((7, 7), np.uint8)
+    # 2. Fechamento Morfológico Forte (Une os triângulos pontilhados da mesma linha)
+    # Aumentado para 11x11 para garantir que pequenas descontinuidades do Furo se tornem um bloco só
+    kernel = np.ones((11, 11), np.uint8)
     mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
     mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
 
-    # 3. Encontrar os Blocos (Contours)
     contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # Ignora ruídos soltos na imagem (área muito pequena)
-    valid_v = [c for c in contours_v if cv2.contourArea(c) > 40]
-    valid_p = [c for c in contours_p if cv2.contourArea(c) > 40]
-
-    # 4. Função Interna Matemática: Avaliação de Paralelismo Físico
-    def tem_paralelas_nao_colineares(contours, dist_minima_px=12.0):
-        if len(contours) < 2:
+    # 3. Lógica Rigorosa de Paralelismo
+    def tem_paralelas_reais(contours):
+        # A. Filtra ruídos - exige que a massa seja densa (área > 60)
+        valid_c = [c for c in contours if cv2.contourArea(c) > 60]
+        
+        if len(valid_c) < 2:
             return False
 
-        for i in range(len(contours)):
-            for j in range(i + 1, len(contours)):
-                c1 = contours[i]
-                c2 = contours[j]
-
-                # Usa o maior bloco como referência base para traçar a linha guia
-                if cv2.contourArea(c1) < cv2.contourArea(c2):
-                    c1, c2 = c2, c1
-
-                if len(c1) >= 4:
-                    # Traça a melhor reta que passa pelo meio do bloco 1
-                    # CUIDADO: fitLine retorna um array 2D em algumas versões do OpenCV
-                    linha = cv2.fitLine(c1, cv2.DIST_L2, 0, 0.01, 0.01)
+        # Extrai propriedades das linhas para cada massa válida
+        linhas_info = []
+        for c in valid_c:
+            if len(c) >= 5: # fitLine precisa de no mínimo 5 pontos para ser estável
+                linha = cv2.fitLine(c, cv2.DIST_L2, 0, 0.01, 0.01)
+                vx = float(linha[0][0])
+                vy = float(linha[1][0])
+                x0 = float(linha[2][0])
+                y0 = float(linha[3][0])
+                
+                # Ângulo em graus
+                ang = math.degrees(math.atan2(vy, vx))
+                if ang < 0: ang += 180
+                
+                # Encontra o Centroide da massa
+                M = cv2.moments(c)
+                if M['m00'] != 0:
+                    cx = float(M['m10'] / M['m00'])
+                    cy = float(M['m01'] / M['m00'])
+                else:
+                    cx = float(c[0][0][0])
+                    cy = float(c[0][0][1])
                     
-                    # Correção do TypeError: Acessar explicitamente a posição [0] do array NumPy
-                    vx = float(linha[0][0])
-                    vy = float(linha[1][0])
-                    x0 = float(linha[2][0])
-                    y0 = float(linha[3][0])
+                linhas_info.append({'vx': vx, 'vy': vy, 'x0': x0, 'y0': y0, 'ang': ang, 'cx': cx, 'cy': cy})
 
-                    # Encontra o "centro de gravidade" (centroide) do bloco 2
-                    M = cv2.moments(c2)
-                    if M['m00'] != 0:
-                        cx = float(M['m10'] / M['m00'])
-                        cy = float(M['m01'] / M['m00'])
-                    else:
-                        cx = float(c2[0][0][0])
-                        cy = float(c2[0][0][1])
+        # B. Compara todos os pares de massas encontradas
+        for i in range(len(linhas_info)):
+            for j in range(i + 1, len(linhas_info)):
+                l1 = linhas_info[i]
+                l2 = linhas_info[j]
 
-                    # Calcula a distância perpendicular do centro do Bloco 2 até a reta do Bloco 1
-                    dist = abs(vy * (cx - x0) - vx * (cy - y0))
-
-                    if dist >= dist_minima_px:
+                # Regra 1: AS RETAS DEVEM SER PARALELAS (Tolerância de 20 graus na inclinação)
+                diff_ang = abs(l1['ang'] - l2['ang'])
+                diff_ang = min(diff_ang, 180 - diff_ang) # Considera a circularidade dos graus
+                
+                if diff_ang <= 20.0: 
+                    # Regra 2: AS RETAS DEVEM ESTAR LADO A LADO (NÃO COLINEARES)
+                    # Calcula a distância ortogonal do centro da Reta 2 até a Reta 1
+                    dist_ortogonal = abs(l1['vy'] * (l2['cx'] - l1['x0']) - l1['vx'] * (l2['cy'] - l1['y0']))
+                    
+                    # Se a distância ortogonal for > 15 pixels, temos uma Reta Paralela Verdadeira!
+                    if dist_ortogonal > 15.0:
                         return True
+                        
         return False
 
-    # 5. Avaliação Final
-    is_bhc_g = tem_paralelas_nao_colineares(valid_v)
-    is_bhc_p = tem_paralelas_nao_colineares(valid_p)
-
-    if is_bhc_g or is_bhc_p:
+    # Executa o teste de verificação tanto no canal verde quanto no roxo
+    if tem_paralelas_reais(contours_v) or tem_paralelas_reais(contours_p):
         return 'BHC'
-    else:
-        return 'Furo'
+    
+    return 'Furo'
 
 # =====================================================================
 # 2. FUNÇÃO PRINCIPAL DA INTERFACE
