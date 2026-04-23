@@ -83,7 +83,6 @@ def load_yolo_model(nome_pt):
     path_pt = os.path.join(MODEL_DIR, nome_pt)
     
     if os.path.exists(path_pt):
-        # Desliga logs detalhados do modelo durante a execução
         return YOLO(path_pt, task='segment', verbose=False)
     return None 
 
@@ -102,7 +101,6 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    # Marcador espesso original - Necessário para a IA reconhecer os Furos
     size_x = 10
     size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
@@ -227,13 +225,13 @@ def main():
 
     with col_botoes:
         st.markdown("<br>", unsafe_allow_html=True)
-        btn_run = st.button("🚀 Iniciar Inferências", type="primary", width="stretch", disabled=not arquivos_prontos)
+        btn_run = st.button("🚀 Iniciar Inferências", type="primary", use_container_width=True, disabled=not arquivos_prontos)
         
-        if st.button("🧹 Limpar Caixa de Upload", width="stretch"):
+        if st.button("🧹 Limpar Caixa de Upload", use_container_width=True):
             st.session_state.uploader_key += 1 
             st.rerun()
 
-        if st.button("🗑️ Resetar Sistema", width="stretch"):
+        if st.button("🗑️ Resetar Sistema", use_container_width=True):
             st.session_state.deteccoes = []
             st.session_state.img_gallery = []
             st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
@@ -346,13 +344,38 @@ def main():
                                 if not suprimido: 
                                     dets_mescladas.append(d)
 
-                            final_dets = dets_mescladas
+                            # =========================================================
+                            # FILTRO DE COR E DIMENSÃO PARA A CLASSE 'Furo'
+                            # =========================================================
+                            valid_dets = []
+                            for d in dets_mescladas:
+                                x1_orig, y1_orig, x2_orig, y2_orig = d['box']
+                                px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
+                                
+                                largura_mm = int(abs(px2 - px1) * 2400)
+                                altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
+                                altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
+                                
+                                if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
+                                    # 1. Checa a proporção
+                                    if largura_mm <= 130 or altura_mm <= 15:
+                                        continue
+                                        
+                                    # 2. Checa as cores na matriz da imagem original (BGR)
+                                    roi = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
+                                    tem_verde = np.any(np.all(roi == [0, 128, 0], axis=-1))
+                                    tem_roxo = np.any(np.all(roi == [128, 0, 128], axis=-1))
+                                    
+                                    if not (tem_verde and tem_roxo):
+                                        continue
+                                        
+                                valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
 
-                            if final_dets:
+                            if valid_dets:
                                 VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
                                 
-                                for local_id, d in enumerate(final_dets, 1):
+                                for local_id, (d, largura_mm, altura_mm, px1, px2, py1, py2) in enumerate(valid_dets, 1):
                                     x1_orig, y1_orig, x2_orig, y2_orig = d['box']
                                     area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
                                     
@@ -364,13 +387,8 @@ def main():
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), (0,0,255), 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
-                                    px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
-                                    
-                                    largura_mm = int(abs(px2 - px1) * 2400)
-                                    altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
-                                    altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                     
                                     found.append({
                                         'ID_Global': len(found), 
@@ -467,7 +485,7 @@ def main():
                             data=excel_data, 
                             file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            width="stretch",
+                            use_container_width=True,
                             type="primary"
                         )
         else:
@@ -514,14 +532,14 @@ def main():
                     col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
                     with col_nav_esq:
                         if st.session_state.audit_idx[local_selecionado] > 0:
-                            if st.button("⬅️ Imagem Anterior", width="stretch", key="btn_prev"):
+                            if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_prev"):
                                 st.session_state.audit_idx[local_selecionado] -= 1
                                 st.rerun()
                     with col_nav_centro:
                         st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx[local_selecionado] + 1} de {total_imagens_det} ({local_selecionado})</h5>", unsafe_allow_html=True)
                     with col_nav_dir:
                         if st.session_state.audit_idx[local_selecionado] < total_imagens_det - 1:
-                            if st.button("Próxima Imagem ➡️", width="stretch", key="btn_next"):
+                            if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_next"):
                                 st.session_state.audit_idx[local_selecionado] += 1
                                 st.rerun()
                     
@@ -570,7 +588,7 @@ def main():
                             data=gerar_zip_dataset(),
                             file_name=f"dataset_multi_retreino_{datetime.now().strftime('%d%m%H%M')}.zip",
                             mime="application/zip",
-                            width="content"
+                            use_container_width=True
                         )
                 else:
                     if local_selecionado == "Patim":
@@ -602,14 +620,14 @@ def main():
                     col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
                     with col_pg_esq:
                         if st.session_state.page[local_selecionado] > 0:
-                            if st.button("⬅️ Anterior", width="stretch", key="pg_gal_prev"):
+                            if st.button("⬅️ Anterior", use_container_width=True, key="pg_gal_prev"):
                                 st.session_state.page[local_selecionado] -= 1
                                 st.rerun()
                     with col_pg_centro:
                         st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
                     with col_pg_dir:
                         if st.session_state.page[local_selecionado] < total_paginas - 1:
-                            if st.button("Próxima ➡️", width="stretch", key="pg_gal_next"):
+                            if st.button("Próxima ➡️", use_container_width=True, key="pg_gal_next"):
                                 st.session_state.page[local_selecionado] += 1
                                 st.rerun()
 
