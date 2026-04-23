@@ -51,7 +51,7 @@ from scipy.spatial import cKDTree
 # 1. CONFIGURAÇÕES GLOBAIS E FUNÇÕES BASE
 # =====================================================================
 CONFIG_MODELOS = {
-    "Alma": "best_alma_1.pt",
+    "Alma": "best_alma_2.pt",
     "Boleto": "best_boleto_1.pt",
     "Patim": "best_patim_1.pt"
 }
