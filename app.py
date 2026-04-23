@@ -4,23 +4,20 @@ import os
 import tempfile
 import base64
 import warnings
-import math # Adicionado para cálculo de ângulos geométricos
+import math
 
 # =====================================================================
 # BLOQUEIO DE LOGS, TELEMETRIA E "PHONE HOME" DO YOLO
-# (Deve ocorrer estritamente antes da importação da biblioteca)
 # =====================================================================
-# 1. Cria a pasta fisicamente na área temporária antes do YOLO tentar
 TMP_DIR = tempfile.gettempdir()
 YOLO_CFG_DIR = os.path.join(TMP_DIR, 'Ultralytics_Config')
 os.makedirs(YOLO_CFG_DIR, exist_ok=True) 
 
-# 2. Injeta as chaves de isolamento offline no sistema
 os.environ['YOLO_CONFIG_DIR'] = YOLO_CFG_DIR
 os.environ['YOLO_VERBOSE'] = 'False'
-os.environ['YOLO_TELEMETRY'] = 'False'    # Desliga a telemetria (evita erro de conexão)
-os.environ['YOLO_UPDATE_CHECK'] = 'False' # Impede checagem de atualizações
-os.environ['YOLO_SYNC'] = 'False'         # Impede sincronização online
+os.environ['YOLO_TELEMETRY'] = 'False'
+os.environ['YOLO_UPDATE_CHECK'] = 'False'
+os.environ['YOLO_SYNC'] = 'False'
 
 # =====================================================================
 # 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
@@ -82,7 +79,6 @@ def remover_pontos_isolados(df, raio=15):
 def load_yolo_model(nome_pt):
     if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
     path_pt = os.path.join(MODEL_DIR, nome_pt)
-    
     if os.path.exists(path_pt):
         return YOLO(path_pt, task='segment', verbose=False)
     return None 
@@ -132,57 +128,60 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO NOVA: CLASSIFICADOR GEOMÉTRICO (Furo vs BHC)
+# FUNÇÃO ATUALIZADA: CLASSIFICADOR COM FILTRO DE COLINEARIDADE
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
-    Analisa o interior da segmentação em busca de paralelismo para diferenciar BHC de Furo.
+    Analisa o interior da segmentação em busca de paralelismo REAL (não-colinear) 
+    para diferenciar BHC de Furo.
     """
-    # 1. Preparar a máscara (converter de bool para uint8 0/255)
     mask_u8 = (roi_mask_bool.astype(np.uint8) * 255)
-    
-    # 2. Erodar a máscara para remover o contorno/bordas do componente detectado
-    # Kernel 5x5 garante uma margem de segurança boa para dentro da peça
     kernel = np.ones((5,5), np.uint8)
     mask_eroded = cv2.erode(mask_u8, kernel, iterations=2)
-    
-    # 3. Isolar estritamente o conteúdo interno
     roi_isolada = cv2.bitwise_and(roi_bgr, roi_bgr, mask=mask_eroded)
     
-    # 4. Detecção de Bordas Internas
     gray = cv2.cvtColor(roi_isolada, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150, apertureSize=3)
     
-    # 5. Extração de Linhas (Transformada de Hough Probabilística)
-    minLineLength = 10  # Ajuste conforme o tamanho típico das retas internas
+    minLineLength = 10
     maxLineGap = 5
     lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20, minLineLength=minLineLength, maxLineGap=maxLineGap)
     
     if lines is None:
-        return 'Furo' # Se não tem linhas estruturadas dentro, é um furo comum
+        return 'Furo'
         
-    # 6. Cálculo das Inclinações (Ângulos)
-    angulos = []
+    # 1. Armazena ângulos e coordenadas
+    linhas_info = []
     for line in lines:
         x1, y1, x2, y2 = line[0]
         theta = math.degrees(math.atan2((y2 - y1), (x2 - x1)))
-        if theta < 0: theta += 180 # Normalizar para 0 a 180 graus
-        angulos.append(theta)
+        if theta < 0: theta += 180
+        linhas_info.append((theta, x1, y1, x2, y2))
         
-    # 7. Contagem de Pares Paralelos
-    pares_paralelos = 0
-    tolerancia_graus = 4.0 # Margem de variação aceitável para considerar retas paralelas
+    # 2. Avaliação rigorosa de Paralelismo vs Colinearidade
+    pares_paralelos_reais = 0
+    tolerancia_graus = 5.0      # Margem angular para considerar paralelo
+    distancia_minima_px = 8.0   # Distância ortogonal (em pixels) para provar que NÃO são a mesma reta (colineares)
     
-    for i in range(len(angulos)):
-        for j in range(i + 1, len(angulos)):
-            diff = abs(angulos[i] - angulos[j])
+    for i in range(len(linhas_info)):
+        for j in range(i + 1, len(linhas_info)):
+            t1, x1, y1, x2, y2 = linhas_info[i]
+            t2, x3, y3, x4, y4 = linhas_info[j]
+            
+            diff = abs(t1 - t2)
             if diff < tolerancia_graus or abs(diff - 180) < tolerancia_graus:
-                pares_paralelos += 1
+                # São paralelas em ângulo. Agora checamos a distância ortogonal do ponto (x3, y3) até a reta 1.
+                denominador = math.sqrt((y2 - y1)**2 + (x2 - x1)**2)
                 
-    # 8. Lógica de Diferenciação
-    # Se detectarmos um número significativo de paralelismo interno, classificamos como BHC
-    limiar_pares_bhc = 2 # Exige pelo menos 2 ocorrências de retas com ângulos iguais
-    if pares_paralelos >= limiar_pares_bhc:
+                if denominador > 0:
+                    distancia = abs((y2 - y1)*x3 - (x2 - x1)*y3 + x2*y1 - y2*x1) / denominador
+                    
+                    # Se a distância for maior que o limiar, elas estão fisicamente separadas (BHC)
+                    if distancia >= distancia_minima_px:
+                        pares_paralelos_reais += 1
+                        
+    # Se encontrou pelo menos UM par de linhas verdadeiramente paralelas e não-colineares, é BHC
+    if pares_paralelos_reais >= 1:
         return 'BHC'
     else:
         return 'Furo'
@@ -401,9 +400,6 @@ def main():
                                 if not suprimido: 
                                     dets_mescladas.append(d)
 
-                            # =========================================================
-                            # NOVO FILTRO GEOMÉTRICO PARA DIFERENCIAÇÃO (Furo vs BHC)
-                            # =========================================================
                             valid_dets = []
                             for d in dets_mescladas:
                                 x1_orig, y1_orig, x2_orig, y2_orig = d['box']
@@ -414,24 +410,18 @@ def main():
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
-                                    # 1. Checa a proporção básica
                                     if largura_mm <= 130 or altura_mm <= 15:
                                         continue
                                         
-                                    # 2. Extrai ROIs (Imagem Original e Máscara Booleana) para o classificador
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # 3. Diferenciação Furo vs BHC baseada em linhas paralelas
                                     classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
                                     d['cls_nome'] = classe_refinada
                                     
-                                    # Opcional: Se BHC for detectado, atribuímos um ID fictício para o TXT de exportação 
-                                    # para não misturar com os Furos rotulados pelo YOLO
                                     if classe_refinada == 'BHC':
                                         d['cls_id'] = 99 
 
-                                    # 4. Checagem de segurança em cores (Opcional, mantida do original)
                                     tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
                                     tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
                                     if not (tem_verde and tem_roxo):
@@ -452,7 +442,6 @@ def main():
                                     x2 = int((x2_orig / w_img) * VIS_W)
                                     y2 = int((y2_orig / h_img) * VIS_H)
                                     
-                                    # Altera a cor do bounding box se for BHC para visualização
                                     cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 0, 255)
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
