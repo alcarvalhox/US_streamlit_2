@@ -128,60 +128,85 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO ATUALIZADA: CLASSIFICADOR COM FILTRO DE COLINEARIDADE
+# FUNÇÃO REESTRUTURADA: ANÁLISE TOPOLÓGICA (BLOBS) + COLINEARIDADE
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
-    Analisa o interior da segmentação em busca de paralelismo REAL (não-colinear) 
-    para diferenciar BHC de Furo.
+    Substitui a Transformada de Hough por Análise de Componentes Conexos (Blobs).
+    Resolve o problema do contorno serrilhado (falsos paralelos).
     """
-    mask_u8 = (roi_mask_bool.astype(np.uint8) * 255)
-    kernel = np.ones((5,5), np.uint8)
-    mask_eroded = cv2.erode(mask_u8, kernel, iterations=2)
-    roi_isolada = cv2.bitwise_and(roi_bgr, roi_bgr, mask=mask_eroded)
-    
-    gray = cv2.cvtColor(roi_isolada, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-    
-    minLineLength = 10
-    maxLineGap = 5
-    lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=20, minLineLength=minLineLength, maxLineGap=maxLineGap)
-    
-    if lines is None:
-        return 'Furo'
-        
-    # 1. Armazena ângulos e coordenadas
-    linhas_info = []
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
-        theta = math.degrees(math.atan2((y2 - y1), (x2 - x1)))
-        if theta < 0: theta += 180
-        linhas_info.append((theta, x1, y1, x2, y2))
-        
-    # 2. Avaliação rigorosa de Paralelismo vs Colinearidade
-    pares_paralelos_reais = 0
-    tolerancia_graus = 5.0      # Margem angular para considerar paralelo
-    distancia_minima_px = 8.0   # Distância ortogonal (em pixels) para provar que NÃO são a mesma reta (colineares)
-    
-    for i in range(len(linhas_info)):
-        for j in range(i + 1, len(linhas_info)):
-            t1, x1, y1, x2, y2 = linhas_info[i]
-            t2, x3, y3, x4, y4 = linhas_info[j]
-            
-            diff = abs(t1 - t2)
-            if diff < tolerancia_graus or abs(diff - 180) < tolerancia_graus:
-                # São paralelas em ângulo. Agora checamos a distância ortogonal do ponto (x3, y3) até a reta 1.
-                denominador = math.sqrt((y2 - y1)**2 + (x2 - x1)**2)
-                
-                if denominador > 0:
-                    distancia = abs((y2 - y1)*x3 - (x2 - x1)*y3 + x2*y1 - y2*x1) / denominador
-                    
-                    # Se a distância for maior que o limiar, elas estão fisicamente separadas (BHC)
-                    if distancia >= distancia_minima_px:
-                        pares_paralelos_reais += 1
-                        
-    # Se encontrou pelo menos UM par de linhas verdadeiramente paralelas e não-colineares, é BHC
-    if pares_paralelos_reais >= 1:
+    # 1. Filtro de Cores (Focado exatamente nos tons RGB do CSV gerador)
+    lower_green = np.array([0, 100, 0], dtype=np.uint8)
+    upper_green = np.array([50, 150, 50], dtype=np.uint8)
+    mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
+
+    lower_purple = np.array([100, 0, 100], dtype=np.uint8)
+    upper_purple = np.array([150, 50, 150], dtype=np.uint8)
+    mask_roxa = cv2.inRange(roi_bgr, lower_purple, upper_purple)
+
+    # Aplica a máscara do YOLO para restringir a análise à peça detectada
+    mask_yolo_u8 = (roi_mask_bool.astype(np.uint8) * 255)
+    mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
+    mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
+
+    # 2. Operação Morfológica de Fechamento (Closing)
+    # Isso funde os pequenos triângulos de uma mesma reta em um único grande bloco (blob),
+    # eliminando a chance de achar retas falsas no serrilhado interno.
+    kernel = np.ones((7, 7), np.uint8)
+    mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
+    mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
+
+    # 3. Encontrar os Blocos (Contours)
+    contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Ignora ruídos soltos na imagem (área muito pequena)
+    valid_v = [c for c in contours_v if cv2.contourArea(c) > 40]
+    valid_p = [c for c in contours_p if cv2.contourArea(c) > 40]
+
+    # 4. Função Interna Matemática: Avaliação de Paralelismo Físico
+    def tem_paralelas_nao_colineares(contours, dist_minima_px=12.0):
+        # Se só tem 1 bloco (ou 0), é impossível ser paralela.
+        if len(contours) < 2:
+            return False
+
+        # Se tem 2 ou mais blocos, precisamos testar se estão lado-a-lado ou na mesma linha (quebrada)
+        for i in range(len(contours)):
+            for j in range(i + 1, len(contours)):
+                c1 = contours[i]
+                c2 = contours[j]
+
+                # Usa o maior bloco como referência base para traçar a linha guia
+                if cv2.contourArea(c1) < cv2.contourArea(c2):
+                    c1, c2 = c2, c1
+
+                if len(c1) >= 4:
+                    # Traça a melhor reta que passa pelo meio do bloco 1
+                    [vx, vy, x0, y0] = cv2.fitLine(c1, cv2.DIST_L2, 0, 0.01, 0.01)
+                    vx, vy, x0, y0 = float(vx), float(vy), float(x0), float(y0)
+
+                    # Encontra o "centro de gravidade" (centroide) do bloco 2
+                    M = cv2.moments(c2)
+                    if M['m00'] != 0:
+                        cx = M['m10'] / M['m00']
+                        cy = M['m01'] / M['m00']
+                    else:
+                        cx, cy = float(c2[0][0][0]), float(c2[0][0][1])
+
+                    # Calcula a distância perpendicular do centro do Bloco 2 até a reta do Bloco 1
+                    # Se for > 12 pixels, os blocos estão correndo lado a lado (BHC)
+                    # Se for < 12 pixels, o bloco 2 é apenas a continuação do bloco 1 (Furo Quebrado)
+                    dist = abs(vy * (cx - x0) - vx * (cy - y0))
+
+                    if dist >= dist_minima_px:
+                        return True
+        return False
+
+    # 5. Avaliação Final
+    is_bhc_g = tem_paralelas_nao_colineares(valid_v)
+    is_bhc_p = tem_paralelas_nao_colineares(valid_p)
+
+    if is_bhc_g or is_bhc_p:
         return 'BHC'
     else:
         return 'Furo'
