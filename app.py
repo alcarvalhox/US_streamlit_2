@@ -128,12 +128,12 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO REESTRUTURADA V4: ANÁLISE VETORIAL DE PARALELISMO
+# FUNÇÃO REESTRUTURADA V5: PROJEÇÃO DE EIXOS (OVERLAP DE COORDENADAS)
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
-    Usa Álgebra Linear (Produto Escalar entre Centroides) para provar se 
-    dois pedaços estão LADO A LADO (BHC) ou UM APÓS O OUTRO (Furo quebrado).
+    Identifica BHC apenas se duas massas da mesma cor coexistirem no mesmo 
+    espaço horizontal (Eixo X) com separação vertical (Eixo Y). Ignora curvas quebradas.
     """
     # 1. Filtro de Cores
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
@@ -148,77 +148,66 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
     mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
 
-    # 2. Fechamento Morfológico Suave (Funde apenas os triângulos/serrilhados próximos)
-    kernel = np.ones((7, 7), np.uint8)
+    # 2. Fechamento Morfológico (Funde apenas os pontos da mesma linha de US)
+    kernel = np.ones((9, 9), np.uint8)
     mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
     mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
 
     contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 3. Análise Vetorial entre Contornos
-    def tem_paralelas_reais(contours):
+    # 3. Motor Geométrico B-Scan (Sobreposição Horizontal)
+    def tem_sobreposicao_vertical_exata(contours):
+        # Remove blocos minúsculos (ruídos)
         valid_c = [c for c in contours if cv2.contourArea(c) > 40]
-        if len(valid_c) < 2:
-            return False
+        if len(valid_c) < 2: return False
 
-        # Ordena do maior pedaço (linha principal) para o menor
-        valid_c = sorted(valid_c, key=cv2.contourArea, reverse=True)
+        # Extrai os domínios em X para cada bloco encontrado
+        pts_list = []
+        for c in valid_c:
+            pts = c.reshape(-1, 2)
+            min_x = int(np.min(pts[:, 0]))
+            max_x = int(np.max(pts[:, 0]))
+            pts_list.append({'pts': pts, 'min_x': min_x, 'max_x': max_x})
 
-        for i in range(len(valid_c)):
-            c1 = valid_c[i]
-            if len(c1) < 5: continue
-            
-            # Pega a direção principal do pedaço maior
-            linha = cv2.fitLine(c1, cv2.DIST_L2, 0, 0.01, 0.01)
-            vx = float(linha[0][0])
-            vy = float(linha[1][0])
-            
-            # Centroide do Pedaço 1
-            M1 = cv2.moments(c1)
-            if M1['m00'] == 0: continue
-            cx1 = float(M1['m10'] / M1['m00'])
-            cy1 = float(M1['m01'] / M1['m00'])
+        # Compara todos os pares
+        for i in range(len(pts_list)):
+            for j in range(i+1, len(pts_list)):
+                c1 = pts_list[i]
+                c2 = pts_list[j]
 
-            for j in range(i + 1, len(valid_c)):
-                c2 = valid_c[j]
-                
-                # Centroide do Pedaço 2
-                M2 = cv2.moments(c2)
-                if M2['m00'] == 0:
-                    cx2 = float(c2[0][0][0])
-                    cy2 = float(c2[0][0][1])
-                else:
-                    cx2 = float(M2['m10'] / M2['m00'])
-                    cy2 = float(M2['m01'] / M2['m00'])
+                # Calcula se existe sobreposição no Eixo X (ODO)
+                overlap_min = max(c1['min_x'], c2['min_x'])
+                overlap_max = min(c1['max_x'], c2['max_x'])
+                overlap_width = overlap_max - overlap_min
 
-                # Vetor de conexão entre os dois pedaços
-                ux = cx2 - cx1
-                uy = cy2 - cy1
-                dist = math.hypot(ux, uy)
-                
-                # Se estão colados, é apenas um pedaço que não se fundiu direito
-                if dist < 10.0: continue
+                # Regra 1: Precisam coexistir na mesma região X (margem de 10 pixels p/ evitar falsos toques)
+                if overlap_width >= 10:
+                    y_dists = []
                     
-                ux_norm = ux / dist
-                uy_norm = uy / dist
-                
-                # O Produto Escalar ('dot') mede o alinhamento.
-                # dot ~ 1.0 (Angularmente alinhados: UM ATRÁS DO OUTRO -> Furo quebrado)
-                # dot < 0.85 (Angularmente deslocados: LADO A LADO -> BHC paralelo)
-                dot = abs(ux_norm * vx + uy_norm * vy)
-                
-                # Distância perpendicular puramente lateral
-                sin_val = math.sqrt(max(0.0, 1.0 - dot**2))
-                d_ort = dist * sin_val
-                
-                # Para ser BHC, tem que haver uma distância lateral clara (>= 10px)
-                # E o vetor de conexão NÃO PODE ser colinear com a direção da linha
-                if d_ort >= 10.0 and dot <= 0.85:
-                    return True
+                    # Checa as profundidades (Eixo Y) em 3 pontos na área de sobreposição
+                    check_xs = [overlap_min + 2, overlap_min + overlap_width//2, overlap_max - 2]
+                    
+                    for cx in check_xs:
+                        # Extrai a profundidade dos dois blocos no mesmo ODO 'cx'
+                        mask1 = np.abs(c1['pts'][:, 0] - cx) <= 3
+                        mask2 = np.abs(c2['pts'][:, 0] - cx) <= 3
+                        
+                        p1_y = c1['pts'][mask1][:, 1]
+                        p2_y = c2['pts'][mask2][:, 1]
+                        
+                        if len(p1_y) > 0 and len(p2_y) > 0:
+                            y1_mean = np.mean(p1_y)
+                            y2_mean = np.mean(p2_y)
+                            y_dists.append(abs(y1_mean - y2_mean))
+                    
+                    # Regra 2: Devem estar fisicamente separados na profundidade (BHC paralelo ao Furo)
+                    if len(y_dists) > 0 and np.mean(y_dists) > 12.0:
+                        return True
         return False
 
-    if tem_paralelas_reais(contours_v) or tem_paralelas_reais(contours_p):
+    # Executa a regra do overlap estrito para a cor Verde e, independentemente, para a cor Roxa.
+    if tem_sobreposicao_vertical_exata(contours_v) or tem_sobreposicao_vertical_exata(contours_p):
         return 'BHC'
     
     return 'Furo'
