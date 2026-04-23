@@ -128,13 +128,14 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO REESTRUTURADA V3: ANÁLISE RIGOROSA DE PARALELISMO
+# FUNÇÃO REESTRUTURADA V4: ANÁLISE VETORIAL DE PARALELISMO
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
-    Exige que existam duas massas alongadas, com ângulos similares e espaçadas ortogonalmente.
+    Usa Álgebra Linear (Produto Escalar entre Centroides) para provar se 
+    dois pedaços estão LADO A LADO (BHC) ou UM APÓS O OUTRO (Furo quebrado).
     """
-    # 1. Filtro de Cores Ampliado (cobre variações leves no tom dos pixels do US)
+    # 1. Filtro de Cores
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
     upper_green = np.array([50, 255, 50], dtype=np.uint8)
     mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
@@ -147,70 +148,76 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
     mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
 
-    # 2. Fechamento Morfológico Forte (Une os triângulos pontilhados da mesma linha)
-    # Aumentado para 11x11 para garantir que pequenas descontinuidades do Furo se tornem um bloco só
-    kernel = np.ones((11, 11), np.uint8)
+    # 2. Fechamento Morfológico Suave (Funde apenas os triângulos/serrilhados próximos)
+    kernel = np.ones((7, 7), np.uint8)
     mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
     mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
 
     contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 3. Lógica Rigorosa de Paralelismo
+    # 3. Análise Vetorial entre Contornos
     def tem_paralelas_reais(contours):
-        # A. Filtra ruídos - exige que a massa seja densa (área > 60)
-        valid_c = [c for c in contours if cv2.contourArea(c) > 60]
-        
+        valid_c = [c for c in contours if cv2.contourArea(c) > 40]
         if len(valid_c) < 2:
             return False
 
-        # Extrai propriedades das linhas para cada massa válida
-        linhas_info = []
-        for c in valid_c:
-            if len(c) >= 5: # fitLine precisa de no mínimo 5 pontos para ser estável
-                linha = cv2.fitLine(c, cv2.DIST_L2, 0, 0.01, 0.01)
-                vx = float(linha[0][0])
-                vy = float(linha[1][0])
-                x0 = float(linha[2][0])
-                y0 = float(linha[3][0])
+        # Ordena do maior pedaço (linha principal) para o menor
+        valid_c = sorted(valid_c, key=cv2.contourArea, reverse=True)
+
+        for i in range(len(valid_c)):
+            c1 = valid_c[i]
+            if len(c1) < 5: continue
+            
+            # Pega a direção principal do pedaço maior
+            linha = cv2.fitLine(c1, cv2.DIST_L2, 0, 0.01, 0.01)
+            vx = float(linha[0][0])
+            vy = float(linha[1][0])
+            
+            # Centroide do Pedaço 1
+            M1 = cv2.moments(c1)
+            if M1['m00'] == 0: continue
+            cx1 = float(M1['m10'] / M1['m00'])
+            cy1 = float(M1['m01'] / M1['m00'])
+
+            for j in range(i + 1, len(valid_c)):
+                c2 = valid_c[j]
                 
-                # Ângulo em graus
-                ang = math.degrees(math.atan2(vy, vx))
-                if ang < 0: ang += 180
-                
-                # Encontra o Centroide da massa
-                M = cv2.moments(c)
-                if M['m00'] != 0:
-                    cx = float(M['m10'] / M['m00'])
-                    cy = float(M['m01'] / M['m00'])
+                # Centroide do Pedaço 2
+                M2 = cv2.moments(c2)
+                if M2['m00'] == 0:
+                    cx2 = float(c2[0][0][0])
+                    cy2 = float(c2[0][0][1])
                 else:
-                    cx = float(c[0][0][0])
-                    cy = float(c[0][0][1])
-                    
-                linhas_info.append({'vx': vx, 'vy': vy, 'x0': x0, 'y0': y0, 'ang': ang, 'cx': cx, 'cy': cy})
+                    cx2 = float(M2['m10'] / M2['m00'])
+                    cy2 = float(M2['m01'] / M2['m00'])
 
-        # B. Compara todos os pares de massas encontradas
-        for i in range(len(linhas_info)):
-            for j in range(i + 1, len(linhas_info)):
-                l1 = linhas_info[i]
-                l2 = linhas_info[j]
-
-                # Regra 1: AS RETAS DEVEM SER PARALELAS (Tolerância de 20 graus na inclinação)
-                diff_ang = abs(l1['ang'] - l2['ang'])
-                diff_ang = min(diff_ang, 180 - diff_ang) # Considera a circularidade dos graus
+                # Vetor de conexão entre os dois pedaços
+                ux = cx2 - cx1
+                uy = cy2 - cy1
+                dist = math.hypot(ux, uy)
                 
-                if diff_ang <= 20.0: 
-                    # Regra 2: AS RETAS DEVEM ESTAR LADO A LADO (NÃO COLINEARES)
-                    # Calcula a distância ortogonal do centro da Reta 2 até a Reta 1
-                    dist_ortogonal = abs(l1['vy'] * (l2['cx'] - l1['x0']) - l1['vx'] * (l2['cy'] - l1['y0']))
+                # Se estão colados, é apenas um pedaço que não se fundiu direito
+                if dist < 10.0: continue
                     
-                    # Se a distância ortogonal for > 15 pixels, temos uma Reta Paralela Verdadeira!
-                    if dist_ortogonal > 15.0:
-                        return True
-                        
+                ux_norm = ux / dist
+                uy_norm = uy / dist
+                
+                # O Produto Escalar ('dot') mede o alinhamento.
+                # dot ~ 1.0 (Angularmente alinhados: UM ATRÁS DO OUTRO -> Furo quebrado)
+                # dot < 0.85 (Angularmente deslocados: LADO A LADO -> BHC paralelo)
+                dot = abs(ux_norm * vx + uy_norm * vy)
+                
+                # Distância perpendicular puramente lateral
+                sin_val = math.sqrt(max(0.0, 1.0 - dot**2))
+                d_ort = dist * sin_val
+                
+                # Para ser BHC, tem que haver uma distância lateral clara (>= 10px)
+                # E o vetor de conexão NÃO PODE ser colinear com a direção da linha
+                if d_ort >= 10.0 and dot <= 0.85:
+                    return True
         return False
 
-    # Executa o teste de verificação tanto no canal verde quanto no roxo
     if tem_paralelas_reais(contours_v) or tem_paralelas_reais(contours_p):
         return 'BHC'
     
