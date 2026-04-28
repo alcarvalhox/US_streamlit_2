@@ -145,8 +145,12 @@ def calcular_inclinacao(mask_bool, x1, y1, x2, y2):
     points = np.column_stack((pts_x, pts_y)).astype(np.float32)
     line = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
     
-    # Extrai o vetor diretor
-    vx, vy = float(line[0]), float(line[1])
+    # Trava de segurança caso o OpenCV não consiga traçar a reta
+    if line is None:
+        return "Indefinida"
+    
+    # Extrai o vetor diretor acessando o valor interno do array
+    vx, vy = float(line[0][0]), float(line[1][0])
     
     # Na imagem (y cresce para baixo), 
     # vx * vy < 0 indica reta subindo para a direita (/)
