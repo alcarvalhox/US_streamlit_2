@@ -136,7 +136,6 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     Identifica BHC apenas se duas massas da mesma cor coexistirem no mesmo 
     espaço horizontal (Eixo X) com separação vertical (Eixo Y). Ignora curvas quebradas.
     """
-    # 1. Filtro de Cores
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
     upper_green = np.array([50, 255, 50], dtype=np.uint8)
     mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
@@ -149,7 +148,6 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
     mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
 
-    # 2. Fechamento Morfológico (Funde apenas os pontos da mesma linha de US)
     kernel = np.ones((9, 9), np.uint8)
     mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
     mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
@@ -157,7 +155,6 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 3. Motor Geométrico B-Scan (Sobreposição Horizontal)
     def tem_sobreposicao_vertical_exata(contours):
         valid_c = [c for c in contours if cv2.contourArea(c) > 40]
         if len(valid_c) < 2: return False
@@ -418,7 +415,6 @@ def main():
                                     dets_mescladas.append(d)
 
                             valid_dets = []
-                            patim_tdfs = []
 
                             for d in dets_mescladas:
                                 x1_orig, y1_orig, x2_orig, y2_orig = d['box']
@@ -450,94 +446,15 @@ def main():
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
                                 
                                 # ========================================================
-                                # EXTRAÇÃO CORRIGIDA DE TDF (Cor Dominante)
+                                # FILTRO PATIM (TDF): SIMPLIFICADO (SOMENTE ALTURA > 10)
                                 # ========================================================
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
-                                    roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
-                                    roi_mask = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
-                                    
-                                    # Extrai a COR DOMINANTE real da máscara (à prova de falhas e artefatos)
-                                    pixels = roi_bgr[roi_mask > 0]
-                                    cor_dominante = None
-                                    if len(pixels) > 0:
-                                        # Remove fundo branco e possíveis ruídos pretos
-                                        pixels_validos = [tuple(p) for p in pixels if tuple(p) not in [(255, 255, 255), (0, 0, 0)]]
-                                        if pixels_validos:
-                                            # Acha a cor que mais repete dentro do bounding box
-                                            cor_dominante = Counter(pixels_validos).most_common(1)[0][0]
-                                            
-                                    center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
-                                    
-                                    patim_tdfs.append({
-                                        'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
-                                        'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
-                                        'odo': center_x_mm, 'cor_dominante': cor_dominante, 'usado_par': False,
-                                        'x1': x1_orig, 'y1': y1_orig, 'x2': x2_orig, 'y2': y2_orig
-                                    })
+                                    if altura_mm > 10:
+                                        valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
+                                
+                                # Outras detecções passam direto
                                 else:
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
-
-                            # ========================================================
-                            # FILTROS DO PATIM INDEPENDENTES (UM NÃO IMPEDE O OUTRO)
-                            # ========================================================
-                            if patim_tdfs:
-                                patim_tdfs.sort(key=lambda x: x['odo'])
-                                
-                                # ----------------------------------------------------
-                                # ITEM 2: Filtro de Severidade Isolada (Processado PRIMEIRO)
-                                # ----------------------------------------------------
-                                for item in patim_tdfs:
-                                    if item['altura_mm'] >= 18:
-                                        # Adicionado imediatamente, independente de ser par ou não futuramente
-                                        valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
-                                        # NÃO marcamos como usado para não impedir o filtro de pares de analisar esse item
-                                        
-                                # ----------------------------------------------------
-                                # ITEM 1: Filtro de Pares Conjugados (Processado DEPOIS)
-                                # ----------------------------------------------------
-                                for i in range(len(patim_tdfs)):
-                                    if patim_tdfs[i]['usado_par']: continue
-                                    if patim_tdfs[i]['altura_mm'] >= 10:
-                                        
-                                        for j in range(i+1, len(patim_tdfs)):
-                                            if patim_tdfs[j]['usado_par']: continue
-                                            if patim_tdfs[j]['altura_mm'] >= 10:
-                                                
-                                                dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
-                                                
-                                                if dist > 360: # Distância passou de 360, pode interromper o loop interno j
-                                                    break
-                                                    
-                                                if 250 <= dist <= 350:
-                                                    c1 = patim_tdfs[i]['cor_dominante']
-                                                    c2 = patim_tdfs[j]['cor_dominante']
-                                                    
-                                                    # Regra de cor resolvida e simplificada
-                                                    # Se ambos possuem uma cor dominante clara, e elas são exatamentes diferentes
-                                                    if c1 is not None and c2 is not None and c1 != c2:
-                                                        patim_tdfs[i]['usado_par'] = True
-                                                        patim_tdfs[j]['usado_par'] = True
-                                                        
-                                                        d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
-                                                        
-                                                        # Cria a caixa agregadora da Dupla Conjugada
-                                                        new_x1 = min(patim_tdfs[i]['x1'], patim_tdfs[j]['x1'])
-                                                        new_y1 = min(patim_tdfs[i]['y1'], patim_tdfs[j]['y1'])
-                                                        new_x2 = max(patim_tdfs[i]['x2'], patim_tdfs[j]['x2'])
-                                                        new_y2 = max(patim_tdfs[i]['y2'], patim_tdfs[j]['y2'])
-                                                        
-                                                        new_d = d1.copy()
-                                                        new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
-                                                        new_d['mask'] = d1['mask'] | d2['mask']
-                                                        new_d['cls_nome'] = 'TDF_Conjugado' # Distingue no label se for dupla
-                                                        
-                                                        n_px1, n_px2 = new_x1/w_img, new_x2/w_img
-                                                        n_py1, n_py2 = new_y1/h_img, new_y2/h_img
-                                                        n_largura_mm = int(abs(n_px2 - n_px1) * 2400)
-                                                        n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
-                                                        
-                                                        valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
-                                                        break
 
                             if valid_dets:
                                 VIS_W, VIS_H = 2400, 400
@@ -552,8 +469,7 @@ def main():
                                     x2 = int((x2_orig / w_img) * VIS_W)
                                     y2 = int((y2_orig / h_img) * VIS_H)
                                     
-                                    # Caixa diferente para distinguir pares
-                                    cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 255, 255) if d['cls_nome'] == 'TDF_Conjugado' else (0, 0, 255)
+                                    cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 0, 255)
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
