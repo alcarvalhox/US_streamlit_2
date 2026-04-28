@@ -489,7 +489,7 @@ def main():
                             dist = abs(side_patim_tdfs[j]['odo'] - side_patim_tdfs[i]['odo'])
                             if dist > 320: break # Distância superada, interrompe varredura desse i
                                 
-                            if 180 <= dist <= 300:
+                            if 200 <= dist <= 300:
                                 v1, r1 = side_patim_tdfs[i]['tem_verde'], side_patim_tdfs[i]['tem_roxo']
                                 v2, r2 = side_patim_tdfs[j]['tem_verde'], side_patim_tdfs[j]['tem_roxo']
                                 h1 = side_patim_tdfs[i]['altura_mm']
@@ -501,6 +501,7 @@ def main():
                                 if par_valido:
                                     side_patim_tdfs[i]['usado'] = True
                                     side_patim_tdfs[j]['usado'] = True
+                                    dist_inteiro = int(dist) # Grava a distância em mm calculada
                                     
                                     if side_patim_tdfs[i]['start'] == side_patim_tdfs[j]['start']:
                                         # Mesma imagem: Funde o retângulo
@@ -514,6 +515,7 @@ def main():
                                         new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
                                         new_d['mask'] = d1['mask'] | d2['mask']
                                         new_d['cls_nome'] = 'TDF_Conjugado'
+                                        new_d['dist_par'] = dist_inteiro # Adiciona a propriedade de distância na detecção
                                         
                                         h_img, w_img = side_windows[0]['img_clean'].shape[:2]
                                         n_px1, n_px2 = new_x1/w_img, new_x2/w_img
@@ -526,9 +528,11 @@ def main():
                                                 w['other_dets'].append({'d': new_d, 'largura_mm': n_largura_mm, 'altura_mm': n_altura_mm, 'px1': n_px1, 'px2': n_px2, 'py1': n_py1, 'py2': n_py2})
                                                 break
                                     else:
-                                        # Imagens diferentes: Etiqueta individualmente sem mesclar as caixas
+                                        # Imagens diferentes: Etiqueta individualmente com a distância, sem mesclar caixas
                                         side_patim_tdfs[i]['d']['cls_nome'] = 'TDF_Conjugado'
+                                        side_patim_tdfs[i]['d']['dist_par'] = dist_inteiro
                                         side_patim_tdfs[j]['d']['cls_nome'] = 'TDF_Conjugado'
+                                        side_patim_tdfs[j]['d']['dist_par'] = dist_inteiro
                                         
                                         for w in side_windows:
                                             if w['start'] == side_patim_tdfs[i]['start']:
@@ -576,7 +580,13 @@ def main():
                             # Caixa diferenciada (Cor Ciano) para os TDFs Conjugados
                             cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 255, 255) if d['cls_nome'] == 'TDF_Conjugado' else (0, 0, 255)
                             cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
-                            cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+                            
+                            # Formatação da etiqueta com a distância inserida caso exista
+                            lbl_text = f"#{local_id} {d['cls_nome']}"
+                            if 'dist_par' in d:
+                                lbl_text += f" ({d['dist_par']}mm)"
+                                
+                            cv2.putText(img_draw, lbl_text, (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                             
                             center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                             center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
