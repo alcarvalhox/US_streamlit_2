@@ -5,6 +5,7 @@ import tempfile
 import base64
 import warnings
 import math
+from collections import Counter
 
 # =====================================================================
 # BLOQUEIO DE LOGS, TELEMETRIA E "PHONE HOME" DO YOLO
@@ -131,10 +132,6 @@ def gerar_zip_dataset():
 # FUNÇÃO REESTRUTURADA V5: PROJEÇÃO DE EIXOS (OVERLAP DE COORDENADAS)
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
-    """
-    Identifica BHC apenas se duas massas da mesma cor coexistirem no mesmo 
-    espaço horizontal (Eixo X) com separação vertical (Eixo Y). Ignora curvas quebradas.
-    """
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
     upper_green = np.array([50, 255, 50], dtype=np.uint8)
     mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
@@ -351,6 +348,10 @@ def main():
             for lado_nome, df_side in lados:
                 if df_side.empty: continue
                 
+                # Variáveis para agregação e processamento global de TDFs por lado
+                side_windows = []
+                side_patim_tdfs = []
+                
                 for start in range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400):
                     passo_atual += 1
                     if total_steps > 0:
@@ -365,6 +366,7 @@ def main():
                         
                         results = model.predict(img_clean, verbose=False, conf=0.05)
                         
+                        valid_dets = []
                         if len(results[0].boxes) > 0:
                             raw_dets = []
                             h_img, w_img = img_clean.shape[:2]
@@ -413,9 +415,6 @@ def main():
                                 if not suprimido: 
                                     dets_mescladas.append(d)
 
-                            valid_dets = []
-                            patim_tdfs = []
-
                             for d in dets_mescladas:
                                 x1_orig, y1_orig, x2_orig, y2_orig = d['box']
                                 px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
@@ -443,125 +442,162 @@ def main():
                                     if not (tem_verde and tem_roxo):
                                         continue
                                         
-                                    valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
+                                    valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
                                 
                                 # ========================================================
-                                # FILTRO PATIM: EXTRAÇÃO DE TDF >= 10mm
+                                # FILTRO PATIM: ACUMULADOR DE TDF >= 6mm
                                 # ========================================================
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
-                                    if altura_mm >= 10:
-                                        # Extrai a cor de dentro da bounding box da detecção
+                                    if altura_mm >= 6:
                                         roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                         tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
                                         tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
                                         
                                         center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                         
-                                        patim_tdfs.append({
+                                        side_patim_tdfs.append({
                                             'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
                                             'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
                                             'odo': center_x_mm, 'tem_verde': tem_verde, 'tem_roxo': tem_roxo, 
-                                            'usado': False, 'x1': x1_orig, 'y1': y1_orig, 'x2': x2_orig, 'y2': y2_orig
+                                            'usado': False, 'x1': x1_orig, 'y1': y1_orig, 'x2': x2_orig, 'y2': y2_orig,
+                                            'start': start
                                         })
                                 
                                 # Outras detecções passam direto
                                 else:
-                                    valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
+                                    valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
 
-                            # ========================================================
-                            # ASSOCIAÇÃO: TDF CONJUGADO (DUPLAS DE CORES DIFERENTES)
-                            # ========================================================
-                            if patim_tdfs:
-                                # Organiza os TDFs da esquerda para a direita (pelo ODO)
-                                patim_tdfs.sort(key=lambda x: x['odo'])
+                        # Salva o frame da janela na lista do lado
+                        side_windows.append({
+                            'start': start,
+                            'img_clean': img_clean,
+                            'other_dets': valid_dets
+                        })
+
+                # ========================================================
+                # ASSOCIAÇÃO GLOBAL: TDF CONJUGADO (DUPLAS DE CORES DIFERENTES)
+                # ========================================================
+                if local_nome == 'Patim' and side_patim_tdfs:
+                    side_patim_tdfs.sort(key=lambda x: x['odo'])
+                    
+                    for i in range(len(side_patim_tdfs)):
+                        if side_patim_tdfs[i]['usado']: continue
+                        
+                        for j in range(i+1, len(side_patim_tdfs)):
+                            if side_patim_tdfs[j]['usado']: continue
+                            
+                            dist = abs(side_patim_tdfs[j]['odo'] - side_patim_tdfs[i]['odo'])
+                            if dist > 320: break # Distância superada, interrompe varredura desse i
                                 
-                                for i in range(len(patim_tdfs)):
-                                    if patim_tdfs[i]['usado']: continue
+                            if 200 <= dist <= 300:
+                                v1, r1 = side_patim_tdfs[i]['tem_verde'], side_patim_tdfs[i]['tem_roxo']
+                                v2, r2 = side_patim_tdfs[j]['tem_verde'], side_patim_tdfs[j]['tem_roxo']
+                                h1 = side_patim_tdfs[i]['altura_mm']
+                                h2 = side_patim_tdfs[j]['altura_mm']
+                                
+                                # Validação: Cores diferentes (Verde/Roxo) e pelo menos um deles com >= 10mm
+                                par_valido = ((v1 and r2) or (r1 and v2)) and (h1 >= 10 or h2 >= 10)
+                                
+                                if par_valido:
+                                    side_patim_tdfs[i]['usado'] = True
+                                    side_patim_tdfs[j]['usado'] = True
                                     
-                                    for j in range(i+1, len(patim_tdfs)):
-                                        if patim_tdfs[j]['usado']: continue
+                                    if side_patim_tdfs[i]['start'] == side_patim_tdfs[j]['start']:
+                                        # Mesma imagem: Funde o retângulo
+                                        d1, d2 = side_patim_tdfs[i]['d'], side_patim_tdfs[j]['d']
+                                        new_x1 = min(side_patim_tdfs[i]['x1'], side_patim_tdfs[j]['x1'])
+                                        new_y1 = min(side_patim_tdfs[i]['y1'], side_patim_tdfs[j]['y1'])
+                                        new_x2 = max(side_patim_tdfs[i]['x2'], side_patim_tdfs[j]['x2'])
+                                        new_y2 = max(side_patim_tdfs[i]['y2'], side_patim_tdfs[j]['y2'])
                                         
-                                        dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
+                                        new_d = d1.copy()
+                                        new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
+                                        new_d['mask'] = d1['mask'] | d2['mask']
+                                        new_d['cls_nome'] = 'TDF_Conjugado'
                                         
-                                        if dist > 320: # Limite máximo de busca para otimizar o loop
-                                            break
-                                            
-                                        # Verifica se estão na janela de 200 a 300 mm
-                                        if 200 <= dist <= 300:
-                                            v1, r1 = patim_tdfs[i]['tem_verde'], patim_tdfs[i]['tem_roxo']
-                                            v2, r2 = patim_tdfs[j]['tem_verde'], patim_tdfs[j]['tem_roxo']
-                                            
-                                            # A dupla é válida se houver a combinação de um Verde e um Roxo
-                                            par_valido = (v1 and r2) or (r1 and v2)
-                                            
-                                            if par_valido:
-                                                patim_tdfs[i]['usado'] = True
-                                                patim_tdfs[j]['usado'] = True
-                                                
-                                                d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
-                                                
-                                                # Cria uma grande Bounding Box englobando as duas detecções
-                                                new_x1 = min(patim_tdfs[i]['x1'], patim_tdfs[j]['x1'])
-                                                new_y1 = min(patim_tdfs[i]['y1'], patim_tdfs[j]['y1'])
-                                                new_x2 = max(patim_tdfs[i]['x2'], patim_tdfs[j]['x2'])
-                                                new_y2 = max(patim_tdfs[i]['y2'], patim_tdfs[j]['y2'])
-                                                
-                                                new_d = d1.copy()
-                                                new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
-                                                new_d['mask'] = d1['mask'] | d2['mask']
-                                                new_d['cls_nome'] = 'TDF_Conjugado'
-                                                
-                                                n_px1, n_px2 = new_x1/w_img, new_x2/w_img
-                                                n_py1, n_py2 = new_y1/h_img, new_y2/h_img
-                                                n_largura_mm = int(abs(n_px2 - n_px1) * 2400)
-                                                n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
-                                                
-                                                valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
+                                        h_img, w_img = side_windows[0]['img_clean'].shape[:2]
+                                        n_px1, n_px2 = new_x1/w_img, new_x2/w_img
+                                        n_py1, n_py2 = new_y1/h_img, new_y2/h_img
+                                        n_largura_mm = int(abs(n_px2 - n_px1) * 2400)
+                                        n_altura_mm = int(abs(n_py2 - n_py1) * 43)
+                                        
+                                        for w in side_windows:
+                                            if w['start'] == side_patim_tdfs[i]['start']:
+                                                w['other_dets'].append({'d': new_d, 'largura_mm': n_largura_mm, 'altura_mm': n_altura_mm, 'px1': n_px1, 'px2': n_px2, 'py1': n_py1, 'py2': n_py2})
                                                 break
-                                                
-                                # Adiciona à lista final todos os TDFs que sobraram e não formaram duplas
-                                for item in patim_tdfs:
-                                    if not item['usado']:
-                                        valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
-
-                            if valid_dets:
-                                VIS_W, VIS_H = 2400, 400
-                                img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
-                                
-                                for local_id, (d, largura_mm, altura_mm, px1, px2, py1, py2) in enumerate(valid_dets, 1):
-                                    x1_orig, y1_orig, x2_orig, y2_orig = d['box']
-                                    area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
+                                    else:
+                                        # Imagens diferentes: Etiqueta individualmente sem mesclar as caixas
+                                        side_patim_tdfs[i]['d']['cls_nome'] = 'TDF_Conjugado'
+                                        side_patim_tdfs[j]['d']['cls_nome'] = 'TDF_Conjugado'
+                                        
+                                        for w in side_windows:
+                                            if w['start'] == side_patim_tdfs[i]['start']:
+                                                w['other_dets'].append({'d': side_patim_tdfs[i]['d'], 'largura_mm': side_patim_tdfs[i]['largura_mm'], 'altura_mm': side_patim_tdfs[i]['altura_mm'], 'px1': side_patim_tdfs[i]['px1'], 'px2': side_patim_tdfs[i]['px2'], 'py1': side_patim_tdfs[i]['py1'], 'py2': side_patim_tdfs[i]['py2']})
+                                            if w['start'] == side_patim_tdfs[j]['start']:
+                                                w['other_dets'].append({'d': side_patim_tdfs[j]['d'], 'largura_mm': side_patim_tdfs[j]['largura_mm'], 'altura_mm': side_patim_tdfs[j]['altura_mm'], 'px1': side_patim_tdfs[j]['px1'], 'px2': side_patim_tdfs[j]['px2'], 'py1': side_patim_tdfs[j]['py1'], 'py2': side_patim_tdfs[j]['py2']})
+                                    break
                                     
-                                    x1 = int((x1_orig / w_img) * VIS_W)
-                                    y1 = int((y1_orig / h_img) * VIS_H)
-                                    x2 = int((x2_orig / w_img) * VIS_W)
-                                    y2 = int((y2_orig / h_img) * VIS_H)
-                                    
-                                    # Caixa diferenciada (Ciano) para os TDFs Conjugados
-                                    cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 255, 255) if d['cls_nome'] == 'TDF_Conjugado' else (0, 0, 255)
-                                    cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
-                                    cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-                                    
-                                    center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
-                                    center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
-                                    
-                                    found.append({
-                                        'ID_Global': len(found), 
-                                        'ID_Img': f"#{local_id}", 
-                                        'Local': local_nome, 
-                                        'Lado': lado_nome, 
-                                        'Classe': d['cls_nome'], 
-                                        'ODO': int(center_x_mm),
-                                        'ODO_Ref': start,
-                                        'Coordenada Depth(mm)': int(center_y_mm),
-                                        'Largura(mm)': largura_mm,
-                                        'Altura(mm)': altura_mm,
-                                        'Área (px)': int(area_caixa),
-                                        'Confiança': f"{d['conf']:.2%}", 
-                                        'Aprovado': True,
-                                        'yolo_bbox': f"{d['cls_id']} {((x1_orig+x2_orig)/2)/w_img:.6f} {((y1_orig+y2_orig)/2)/h_img:.6f} {(x2_orig-x1_orig)/w_img:.6f} {(y2_orig-y1_orig)/h_img:.6f}"
-                                    })
-                                gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
+                    # Re-adiciona TDFs isolados restantes (desde que sejam >= 10mm)
+                    for item in side_patim_tdfs:
+                        if not item['usado']:
+                            if item['altura_mm'] >= 10:
+                                for w in side_windows:
+                                    if w['start'] == item['start']:
+                                        w['other_dets'].append({'d': item['d'], 'largura_mm': item['largura_mm'], 'altura_mm': item['altura_mm'], 'px1': item['px1'], 'px2': item['px2'], 'py1': item['py1'], 'py2': item['py2']})
+                                        break
+                                        
+                # ========================================================
+                # RENDERIZAÇÃO FINAL E SALVAMENTO NA GALERIA
+                # ========================================================
+                for w in side_windows:
+                    if len(w['other_dets']) > 0:
+                        start = w['start']
+                        img_clean = w['img_clean']
+                        valid_dets = w['other_dets']
+                        
+                        VIS_W, VIS_H = 2400, 400
+                        img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
+                        h_img, w_img = img_clean.shape[:2]
+                        
+                        for local_id, det_info in enumerate(valid_dets, 1):
+                            d = det_info['d']
+                            largura_mm = det_info['largura_mm']
+                            altura_mm = det_info['altura_mm']
+                            px1, px2, py1, py2 = det_info['px1'], det_info['px2'], det_info['py1'], det_info['py2']
+                            
+                            x1_orig, y1_orig, x2_orig, y2_orig = d['box']
+                            area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
+                            
+                            x1 = int((x1_orig / w_img) * VIS_W)
+                            y1 = int((y1_orig / h_img) * VIS_H)
+                            x2 = int((x2_orig / w_img) * VIS_W)
+                            y2 = int((y2_orig / h_img) * VIS_H)
+                            
+                            # Caixa diferenciada (Cor Ciano) para os TDFs Conjugados
+                            cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 255, 255) if d['cls_nome'] == 'TDF_Conjugado' else (0, 0, 255)
+                            cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
+                            cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
+                            
+                            center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
+                            center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
+                            
+                            found.append({
+                                'ID_Global': len(found), 
+                                'ID_Img': f"#{local_id}", 
+                                'Local': local_nome, 
+                                'Lado': lado_nome, 
+                                'Classe': d['cls_nome'], 
+                                'ODO': int(center_x_mm),
+                                'ODO_Ref': start,
+                                'Coordenada Depth(mm)': int(center_y_mm),
+                                'Largura(mm)': largura_mm,
+                                'Altura(mm)': altura_mm,
+                                'Área (px)': int(area_caixa),
+                                'Confiança': f"{d['conf']:.2%}", 
+                                'Aprovado': True,
+                                'yolo_bbox': f"{d['cls_id']} {((x1_orig+x2_orig)/2)/w_img:.6f} {((y1_orig+y2_orig)/2)/h_img:.6f} {(x2_orig-x1_orig)/w_img:.6f} {(y2_orig-y1_orig)/h_img:.6f}"
+                            })
+                        gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
         
         progress_bar.progress(1.0, text="✅ Processamento concluído!")
         
