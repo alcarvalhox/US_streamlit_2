@@ -458,29 +458,26 @@ def main():
                                         
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
                                 
-                                # ========================================================
-                                # EXTRAÇÃO E BUFFER DE TDF PARA O PATIM
-                                # ========================================================
+                                # Filtro 2: PATIM (TDF)
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
+                                    # Extração de Cores Robusta: Avalia todos os pixels da bounding box para não depender de falhas da máscara YOLO
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
-                                    roi_mask = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # Extrai as cores reais da máscara
-                                    pixels = roi_bgr[roi_mask > 0]
-                                    cores_presentes = set()
-                                    if len(pixels) > 0:
-                                        # Remove apenas o fundo estritamente branco e preto (ruído da base)
-                                        for p in pixels:
-                                            pt = tuple(p)
-                                            if pt != (255, 255, 255) and pt != (0, 0, 0):
-                                                cores_presentes.add(pt)
-                                                
+                                    if roi_bgr.size > 0:
+                                        # Pega as cores únicas em RGB encontradas na caixa
+                                        unique_colors = np.unique(roi_bgr.reshape(-1, 3), axis=0)
+                                        cores_presentes = {tuple(c) for c in unique_colors if tuple(c) not in [(255, 255, 255), (0, 0, 0)]}
+                                    else:
+                                        cores_presentes = set()
+                                        
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     
+                                    # Guarda no buffer temporário para análise de correlação
                                     patim_tdfs.append({
                                         'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
                                         'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
-                                        'odo': center_x_mm, 'cores': cores_presentes, 'usado': False
+                                        'odo': center_x_mm, 'cores': cores_presentes, 'usado': False,
+                                        'x1': x1_orig, 'y1': y1_orig, 'x2': x2_orig, 'y2': y2_orig
                                     })
                                 else:
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
@@ -491,37 +488,36 @@ def main():
                             if patim_tdfs:
                                 patim_tdfs.sort(key=lambda x: x['odo'])
                                 
-                                # Regra 1: Pares de cores diferentes (250~350mm, altura > 10mm)
+                                # REGRA 1: Busca por Duplas (Pares TDF)
                                 for i in range(len(patim_tdfs)):
                                     if patim_tdfs[i]['usado']: continue
-                                    if patim_tdfs[i]['altura_mm'] <= 10: continue
+                                    if patim_tdfs[i]['altura_mm'] < 10: continue # Condição de altura mínima para parear
                                     
                                     for j in range(i+1, len(patim_tdfs)):
                                         if patim_tdfs[j]['usado']: continue
-                                        if patim_tdfs[j]['altura_mm'] <= 10: continue
+                                        if patim_tdfs[j]['altura_mm'] < 10: continue
                                         
                                         dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
                                         
-                                        if dist > 350:
-                                            break # Distância já excedeu, interrompe loop j
+                                        if dist > 360: # Margem para quebrar o loop interno precocemente se as distâncias ficarem altas
+                                            break
                                             
                                         if 250 <= dist <= 350:
                                             c1 = patim_tdfs[i]['cores']
                                             c2 = patim_tdfs[j]['cores']
                                             
-                                            # Verifica se há cores detectadas e se os conjuntos de cores não se cruzam
-                                            # (isdisjoint == True significa que são de sondas com cores totalmente diferentes)
-                                            if c1 and c2 and c1.isdisjoint(c2):
+                                            # "Cores diferentes": Basta que o array de cores lido não seja idêntico
+                                            if c1 and c2 and c1 != c2:
                                                 patim_tdfs[i]['usado'] = True
                                                 patim_tdfs[j]['usado'] = True
                                                 
                                                 d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
                                                 
-                                                # Mescla os dois retângulos abrangendo as detecções pares
-                                                new_x1 = min(d1['box'][0], d2['box'][0])
-                                                new_y1 = min(d1['box'][1], d2['box'][1])
-                                                new_x2 = max(d1['box'][2], d2['box'][2])
-                                                new_y2 = max(d1['box'][3], d2['box'][3])
+                                                # Cobre ambos com o mesmo retângulo de medição
+                                                new_x1 = min(patim_tdfs[i]['x1'], patim_tdfs[j]['x1'])
+                                                new_y1 = min(patim_tdfs[i]['y1'], patim_tdfs[j]['y1'])
+                                                new_x2 = max(patim_tdfs[i]['x2'], patim_tdfs[j]['x2'])
+                                                new_y2 = max(patim_tdfs[i]['y2'], patim_tdfs[j]['y2'])
                                                 
                                                 new_d = d1.copy()
                                                 new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
@@ -533,13 +529,12 @@ def main():
                                                 n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
                                                 
                                                 valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
-                                                break # Achou o par, pula para a próxima iteração do i
+                                                break # Dupla casada, sai do loop do J e avança o I
                                                 
-                                # Regra 2: Detecções Isoladas (altura > 18mm)
-                                # Processa independentemente tudo que sobrou (não formou par)
+                                # REGRA 2: Processa os Isolados por severidade (>= 18mm)
                                 for item in patim_tdfs:
                                     if not item['usado']:
-                                        if item['altura_mm'] > 18:
+                                        if item['altura_mm'] >= 18:
                                             valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
 
                             if valid_dets:
@@ -559,7 +554,6 @@ def main():
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
-                                    # ODO representa o centro da largura do bounding box detectado
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     
