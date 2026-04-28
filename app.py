@@ -5,6 +5,7 @@ import tempfile
 import base64
 import warnings
 import math
+from collections import Counter
 
 # =====================================================================
 # BLOQUEIO DE LOGS, TELEMETRIA E "PHONE HOME" DO YOLO
@@ -158,11 +159,9 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
 
     # 3. Motor Geométrico B-Scan (Sobreposição Horizontal)
     def tem_sobreposicao_vertical_exata(contours):
-        # Remove blocos minúsculos (ruídos)
         valid_c = [c for c in contours if cv2.contourArea(c) > 40]
         if len(valid_c) < 2: return False
 
-        # Extrai os domínios em X para cada bloco encontrado
         pts_list = []
         for c in valid_c:
             pts = c.reshape(-1, 2)
@@ -170,26 +169,20 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
             max_x = int(np.max(pts[:, 0]))
             pts_list.append({'pts': pts, 'min_x': min_x, 'max_x': max_x})
 
-        # Compara todos os pares
         for i in range(len(pts_list)):
             for j in range(i+1, len(pts_list)):
                 c1 = pts_list[i]
                 c2 = pts_list[j]
 
-                # Calcula se existe sobreposição no Eixo X (ODO)
                 overlap_min = max(c1['min_x'], c2['min_x'])
                 overlap_max = min(c1['max_x'], c2['max_x'])
                 overlap_width = overlap_max - overlap_min
 
-                # Regra 1: Precisam coexistir na mesma região X (margem de 10 pixels p/ evitar falsos toques)
                 if overlap_width >= 10:
                     y_dists = []
-                    
-                    # Checa as profundidades (Eixo Y) em 3 pontos na área de sobreposição
                     check_xs = [overlap_min + 2, overlap_min + overlap_width//2, overlap_max - 2]
                     
                     for cx in check_xs:
-                        # Extrai a profundidade dos dois blocos no mesmo ODO 'cx'
                         mask1 = np.abs(c1['pts'][:, 0] - cx) <= 3
                         mask2 = np.abs(c2['pts'][:, 0] - cx) <= 3
                         
@@ -201,12 +194,10 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
                             y2_mean = np.mean(p2_y)
                             y_dists.append(abs(y1_mean - y2_mean))
                     
-                    # Regra 2: Devem estar fisicamente separados na profundidade (BHC paralelo ao Furo)
                     if len(y_dists) > 0 and np.mean(y_dists) > 12.0:
                         return True
         return False
 
-    # Executa a regra do overlap estrito para a cor Verde e, independentemente, para a cor Roxa.
     if tem_sobreposicao_vertical_exata(contours_v) or tem_sobreposicao_vertical_exata(contours_p):
         return 'BHC'
     
@@ -458,84 +449,95 @@ def main():
                                         
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
                                 
-                                # Filtro 2: PATIM (TDF)
+                                # ========================================================
+                                # EXTRAÇÃO CORRIGIDA DE TDF (Cor Dominante)
+                                # ========================================================
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
-                                    # Extração de Cores Robusta: Avalia todos os pixels da bounding box para não depender de falhas da máscara YOLO
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
+                                    roi_mask = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    if roi_bgr.size > 0:
-                                        # Pega as cores únicas em RGB encontradas na caixa
-                                        unique_colors = np.unique(roi_bgr.reshape(-1, 3), axis=0)
-                                        cores_presentes = {tuple(c) for c in unique_colors if tuple(c) not in [(255, 255, 255), (0, 0, 0)]}
-                                    else:
-                                        cores_presentes = set()
-                                        
+                                    # Extrai a COR DOMINANTE real da máscara (à prova de falhas e artefatos)
+                                    pixels = roi_bgr[roi_mask > 0]
+                                    cor_dominante = None
+                                    if len(pixels) > 0:
+                                        # Remove fundo branco e possíveis ruídos pretos
+                                        pixels_validos = [tuple(p) for p in pixels if tuple(p) not in [(255, 255, 255), (0, 0, 0)]]
+                                        if pixels_validos:
+                                            # Acha a cor que mais repete dentro do bounding box
+                                            cor_dominante = Counter(pixels_validos).most_common(1)[0][0]
+                                            
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     
-                                    # Guarda no buffer temporário para análise de correlação
                                     patim_tdfs.append({
                                         'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
                                         'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
-                                        'odo': center_x_mm, 'cores': cores_presentes, 'usado': False,
+                                        'odo': center_x_mm, 'cor_dominante': cor_dominante, 'usado_par': False,
                                         'x1': x1_orig, 'y1': y1_orig, 'x2': x2_orig, 'y2': y2_orig
                                     })
                                 else:
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
 
                             # ========================================================
-                            # APLICAÇÃO DAS REGRAS (PARES E ISOLADOS) NO PATIM
+                            # FILTROS DO PATIM INDEPENDENTES (UM NÃO IMPEDE O OUTRO)
                             # ========================================================
                             if patim_tdfs:
                                 patim_tdfs.sort(key=lambda x: x['odo'])
                                 
-                                # REGRA 1: Busca por Duplas (Pares TDF)
-                                for i in range(len(patim_tdfs)):
-                                    if patim_tdfs[i]['usado']: continue
-                                    if patim_tdfs[i]['altura_mm'] < 10: continue # Condição de altura mínima para parear
-                                    
-                                    for j in range(i+1, len(patim_tdfs)):
-                                        if patim_tdfs[j]['usado']: continue
-                                        if patim_tdfs[j]['altura_mm'] < 10: continue
-                                        
-                                        dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
-                                        
-                                        if dist > 360: # Margem para quebrar o loop interno precocemente se as distâncias ficarem altas
-                                            break
-                                            
-                                        if 250 <= dist <= 350:
-                                            c1 = patim_tdfs[i]['cores']
-                                            c2 = patim_tdfs[j]['cores']
-                                            
-                                            # "Cores diferentes": Basta que o array de cores lido não seja idêntico
-                                            if c1 and c2 and c1 != c2:
-                                                patim_tdfs[i]['usado'] = True
-                                                patim_tdfs[j]['usado'] = True
-                                                
-                                                d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
-                                                
-                                                # Cobre ambos com o mesmo retângulo de medição
-                                                new_x1 = min(patim_tdfs[i]['x1'], patim_tdfs[j]['x1'])
-                                                new_y1 = min(patim_tdfs[i]['y1'], patim_tdfs[j]['y1'])
-                                                new_x2 = max(patim_tdfs[i]['x2'], patim_tdfs[j]['x2'])
-                                                new_y2 = max(patim_tdfs[i]['y2'], patim_tdfs[j]['y2'])
-                                                
-                                                new_d = d1.copy()
-                                                new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
-                                                new_d['mask'] = d1['mask'] | d2['mask']
-                                                
-                                                n_px1, n_px2 = new_x1/w_img, new_x2/w_img
-                                                n_py1, n_py2 = new_y1/h_img, new_y2/h_img
-                                                n_largura_mm = int(abs(n_px2 - n_px1) * 2400)
-                                                n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
-                                                
-                                                valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
-                                                break # Dupla casada, sai do loop do J e avança o I
-                                                
-                                # REGRA 2: Processa os Isolados por severidade (>= 18mm)
+                                # ----------------------------------------------------
+                                # ITEM 2: Filtro de Severidade Isolada (Processado PRIMEIRO)
+                                # ----------------------------------------------------
                                 for item in patim_tdfs:
-                                    if not item['usado']:
-                                        if item['altura_mm'] >= 18:
-                                            valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
+                                    if item['altura_mm'] >= 18:
+                                        # Adicionado imediatamente, independente de ser par ou não futuramente
+                                        valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
+                                        # NÃO marcamos como usado para não impedir o filtro de pares de analisar esse item
+                                        
+                                # ----------------------------------------------------
+                                # ITEM 1: Filtro de Pares Conjugados (Processado DEPOIS)
+                                # ----------------------------------------------------
+                                for i in range(len(patim_tdfs)):
+                                    if patim_tdfs[i]['usado_par']: continue
+                                    if patim_tdfs[i]['altura_mm'] >= 10:
+                                        
+                                        for j in range(i+1, len(patim_tdfs)):
+                                            if patim_tdfs[j]['usado_par']: continue
+                                            if patim_tdfs[j]['altura_mm'] >= 10:
+                                                
+                                                dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
+                                                
+                                                if dist > 360: # Distância passou de 360, pode interromper o loop interno j
+                                                    break
+                                                    
+                                                if 250 <= dist <= 350:
+                                                    c1 = patim_tdfs[i]['cor_dominante']
+                                                    c2 = patim_tdfs[j]['cor_dominante']
+                                                    
+                                                    # Regra de cor resolvida e simplificada
+                                                    # Se ambos possuem uma cor dominante clara, e elas são exatamentes diferentes
+                                                    if c1 is not None and c2 is not None and c1 != c2:
+                                                        patim_tdfs[i]['usado_par'] = True
+                                                        patim_tdfs[j]['usado_par'] = True
+                                                        
+                                                        d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
+                                                        
+                                                        # Cria a caixa agregadora da Dupla Conjugada
+                                                        new_x1 = min(patim_tdfs[i]['x1'], patim_tdfs[j]['x1'])
+                                                        new_y1 = min(patim_tdfs[i]['y1'], patim_tdfs[j]['y1'])
+                                                        new_x2 = max(patim_tdfs[i]['x2'], patim_tdfs[j]['x2'])
+                                                        new_y2 = max(patim_tdfs[i]['y2'], patim_tdfs[j]['y2'])
+                                                        
+                                                        new_d = d1.copy()
+                                                        new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
+                                                        new_d['mask'] = d1['mask'] | d2['mask']
+                                                        new_d['cls_nome'] = 'TDF_Conjugado' # Distingue no label se for dupla
+                                                        
+                                                        n_px1, n_px2 = new_x1/w_img, new_x2/w_img
+                                                        n_py1, n_py2 = new_y1/h_img, new_y2/h_img
+                                                        n_largura_mm = int(abs(n_px2 - n_px1) * 2400)
+                                                        n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
+                                                        
+                                                        valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
+                                                        break
 
                             if valid_dets:
                                 VIS_W, VIS_H = 2400, 400
@@ -550,7 +552,8 @@ def main():
                                     x2 = int((x2_orig / w_img) * VIS_W)
                                     y2 = int((y2_orig / h_img) * VIS_H)
                                     
-                                    cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 0, 255)
+                                    # Caixa diferente para distinguir pares
+                                    cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 255, 255) if d['cls_nome'] == 'TDF_Conjugado' else (0, 0, 255)
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
