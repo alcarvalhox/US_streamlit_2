@@ -489,7 +489,7 @@ def main():
                             dist = abs(side_patim_tdfs[j]['odo'] - side_patim_tdfs[i]['odo'])
                             if dist > 320: break # Distância superada, interrompe varredura desse i
                                 
-                            if 200 <= dist <= 300:
+                            if 180 <= dist <= 300:
                                 v1, r1 = side_patim_tdfs[i]['tem_verde'], side_patim_tdfs[i]['tem_roxo']
                                 v2, r2 = side_patim_tdfs[j]['tem_verde'], side_patim_tdfs[j]['tem_roxo']
                                 h1 = side_patim_tdfs[i]['altura_mm']
