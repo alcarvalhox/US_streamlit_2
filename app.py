@@ -128,7 +128,7 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO REESTRUTURADA V5: PROJEÇÃO DE EIXOS (OVERLAP DE COORDENADAS)
+# FUNÇÃO: PROJEÇÃO DE EIXOS (OVERLAP DE COORDENADAS)
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
@@ -158,11 +158,9 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
 
     # 3. Motor Geométrico B-Scan (Sobreposição Horizontal)
     def tem_sobreposicao_vertical_exata(contours):
-        # Remove blocos minúsculos (ruídos)
         valid_c = [c for c in contours if cv2.contourArea(c) > 40]
         if len(valid_c) < 2: return False
 
-        # Extrai os domínios em X para cada bloco encontrado
         pts_list = []
         for c in valid_c:
             pts = c.reshape(-1, 2)
@@ -170,26 +168,20 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
             max_x = int(np.max(pts[:, 0]))
             pts_list.append({'pts': pts, 'min_x': min_x, 'max_x': max_x})
 
-        # Compara todos os pares
         for i in range(len(pts_list)):
             for j in range(i+1, len(pts_list)):
                 c1 = pts_list[i]
                 c2 = pts_list[j]
 
-                # Calcula se existe sobreposição no Eixo X (ODO)
                 overlap_min = max(c1['min_x'], c2['min_x'])
                 overlap_max = min(c1['max_x'], c2['max_x'])
                 overlap_width = overlap_max - overlap_min
 
-                # Regra 1: Precisam coexistir na mesma região X (margem de 10 pixels p/ evitar falsos toques)
                 if overlap_width >= 10:
                     y_dists = []
-                    
-                    # Checa as profundidades (Eixo Y) em 3 pontos na área de sobreposição
                     check_xs = [overlap_min + 2, overlap_min + overlap_width//2, overlap_max - 2]
                     
                     for cx in check_xs:
-                        # Extrai a profundidade dos dois blocos no mesmo ODO 'cx'
                         mask1 = np.abs(c1['pts'][:, 0] - cx) <= 3
                         mask2 = np.abs(c2['pts'][:, 0] - cx) <= 3
                         
@@ -201,12 +193,10 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
                             y2_mean = np.mean(p2_y)
                             y_dists.append(abs(y1_mean - y2_mean))
                     
-                    # Regra 2: Devem estar fisicamente separados na profundidade (BHC paralelo ao Furo)
                     if len(y_dists) > 0 and np.mean(y_dists) > 12.0:
                         return True
         return False
 
-    # Executa a regra do overlap estrito para a cor Verde e, independentemente, para a cor Roxa.
     if tem_sobreposicao_vertical_exata(contours_v) or tem_sobreposicao_vertical_exata(contours_p):
         return 'BHC'
     
@@ -427,6 +417,8 @@ def main():
                                     dets_mescladas.append(d)
 
                             valid_dets = []
+                            patim_tdfs = []
+
                             for d in dets_mescladas:
                                 x1_orig, y1_orig, x2_orig, y2_orig = d['box']
                                 px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
@@ -435,7 +427,7 @@ def main():
                                 altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
-                                # Filtro 1: ALMA (Furos)
+                                # Filtro 1: ALMA (Furos e BHC)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     if largura_mm <= 130 or altura_mm <= 15:
                                         continue
@@ -453,14 +445,78 @@ def main():
                                     tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
                                     if not (tem_verde and tem_roxo):
                                         continue
-                                
-                                # Filtro 2: PATIM (TDF)
-                                if local_nome == 'Patim' and d['cls_nome'] == 'TDF':
-                                    if altura_mm < 10:
-                                        continue
                                         
-                                valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
+                                    valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
+                                
+                                # Filtro 2: PATIM (Buffer de TDFs para analise de Pares)
+                                elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
+                                    roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
+                                    tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
+                                    tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
+                                    center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
+                                    
+                                    patim_tdfs.append({
+                                        'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
+                                        'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
+                                        'odo': center_x_mm, 'tem_verde': tem_verde, 'tem_roxo': tem_roxo, 'used': False
+                                    })
+                                else:
+                                    valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
 
+                            # PROCESSAMENTO DE PARES TDF (PATIM)
+                            if patim_tdfs:
+                                patim_tdfs.sort(key=lambda x: x['odo'])
+                                
+                                # 1. Busca por duplas (TDF Pareado/Conjugado)
+                                for i in range(len(patim_tdfs)):
+                                    if patim_tdfs[i]['used']: continue
+                                    if patim_tdfs[i]['altura_mm'] < 10: continue
+                                    
+                                    for j in range(i+1, len(patim_tdfs)):
+                                        if patim_tdfs[j]['used']: continue
+                                        if patim_tdfs[j]['altura_mm'] < 10: continue
+                                        
+                                        dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
+                                        
+                                        if dist > 350: 
+                                            break # Como está ordenado, os próximos serão ainda mais longe
+                                            
+                                        if 250 <= dist <= 350:
+                                            # Verifica se são de cores diferentes (uma responde a verde, outra a roxo)
+                                            v1, r1 = patim_tdfs[i]['tem_verde'], patim_tdfs[i]['tem_roxo']
+                                            v2, r2 = patim_tdfs[j]['tem_verde'], patim_tdfs[j]['tem_roxo']
+                                            
+                                            if (v1 and r2) or (r1 and v2):
+                                                patim_tdfs[i]['used'] = True
+                                                patim_tdfs[j]['used'] = True
+                                                
+                                                d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
+                                                
+                                                # Mescla as duas detecções em um único retângulo
+                                                new_x1 = min(d1['box'][0], d2['box'][0])
+                                                new_y1 = min(d1['box'][1], d2['box'][1])
+                                                new_x2 = max(d1['box'][2], d2['box'][2])
+                                                new_y2 = max(d1['box'][3], d2['box'][3])
+                                                
+                                                new_d = d1.copy()
+                                                new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
+                                                new_d['mask'] = d1['mask'] | d2['mask'] # Junta as máscaras para refinar
+                                                
+                                                n_px1, n_px2 = new_x1/w_img, new_x2/w_img
+                                                n_py1, n_py2 = new_y1/h_img, new_y2/h_img
+                                                n_largura_mm = int(abs(n_px2 - n_px1) * 2400)
+                                                n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
+                                                
+                                                valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
+                                                break # Dupla encontrada, vai para o próximo i
+                                                
+                                # 2. Processa as detecções isoladas que sobraram
+                                for item in patim_tdfs:
+                                    if not item['used']:
+                                        if item['altura_mm'] > 18:
+                                            valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
+
+                            # DESENHO E CONSTRUÇÃO DOS METADADOS FINAIS
                             if valid_dets:
                                 VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
@@ -478,7 +534,6 @@ def main():
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
-                                    # ODO representa o centro da largura do bounding box detectado
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     
