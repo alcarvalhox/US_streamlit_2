@@ -128,12 +128,14 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO: PROJEÇÃO DE EIXOS (OVERLAP DE COORDENADAS)
+# FUNÇÃO REESTRUTURADA V5: PROJEÇÃO DE EIXOS (OVERLAP DE COORDENADAS)
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
-    Identifica BHC na Alma se duas massas (verde/roxo) coexistirem no mesmo espaço horizontal.
+    Identifica BHC apenas se duas massas da mesma cor coexistirem no mesmo 
+    espaço horizontal (Eixo X) com separação vertical (Eixo Y). Ignora curvas quebradas.
     """
+    # 1. Filtro de Cores
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
     upper_green = np.array([50, 255, 50], dtype=np.uint8)
     mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
@@ -146,6 +148,7 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
     mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
 
+    # 2. Fechamento Morfológico (Funde apenas os pontos da mesma linha de US)
     kernel = np.ones((9, 9), np.uint8)
     mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
     mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
@@ -153,10 +156,13 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    # 3. Motor Geométrico B-Scan (Sobreposição Horizontal)
     def tem_sobreposicao_vertical_exata(contours):
+        # Remove blocos minúsculos (ruídos)
         valid_c = [c for c in contours if cv2.contourArea(c) > 40]
         if len(valid_c) < 2: return False
 
+        # Extrai os domínios em X para cada bloco encontrado
         pts_list = []
         for c in valid_c:
             pts = c.reshape(-1, 2)
@@ -164,20 +170,26 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
             max_x = int(np.max(pts[:, 0]))
             pts_list.append({'pts': pts, 'min_x': min_x, 'max_x': max_x})
 
+        # Compara todos os pares
         for i in range(len(pts_list)):
             for j in range(i+1, len(pts_list)):
                 c1 = pts_list[i]
                 c2 = pts_list[j]
 
+                # Calcula se existe sobreposição no Eixo X (ODO)
                 overlap_min = max(c1['min_x'], c2['min_x'])
                 overlap_max = min(c1['max_x'], c2['max_x'])
                 overlap_width = overlap_max - overlap_min
 
+                # Regra 1: Precisam coexistir na mesma região X (margem de 10 pixels p/ evitar falsos toques)
                 if overlap_width >= 10:
                     y_dists = []
+                    
+                    # Checa as profundidades (Eixo Y) em 3 pontos na área de sobreposição
                     check_xs = [overlap_min + 2, overlap_min + overlap_width//2, overlap_max - 2]
                     
                     for cx in check_xs:
+                        # Extrai a profundidade dos dois blocos no mesmo ODO 'cx'
                         mask1 = np.abs(c1['pts'][:, 0] - cx) <= 3
                         mask2 = np.abs(c2['pts'][:, 0] - cx) <= 3
                         
@@ -189,10 +201,12 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
                             y2_mean = np.mean(p2_y)
                             y_dists.append(abs(y1_mean - y2_mean))
                     
+                    # Regra 2: Devem estar fisicamente separados na profundidade (BHC paralelo ao Furo)
                     if len(y_dists) > 0 and np.mean(y_dists) > 12.0:
                         return True
         return False
 
+    # Executa a regra do overlap estrito para a cor Verde e, independentemente, para a cor Roxa.
     if tem_sobreposicao_vertical_exata(contours_v) or tem_sobreposicao_vertical_exata(contours_p):
         return 'BHC'
     
@@ -423,7 +437,7 @@ def main():
                                 altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
-                                # Filtro 1: ALMA (Furos e BHC)
+                                # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     if largura_mm <= 130 or altura_mm <= 15:
                                         continue
@@ -444,62 +458,66 @@ def main():
                                         
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
                                 
-                                # Filtro 2: PATIM (Buffer Dinâmico de Cores para TDFs)
+                                # ========================================================
+                                # EXTRAÇÃO E BUFFER DE TDF PARA O PATIM
+                                # ========================================================
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # Mapeia dinamicamente as cores reais que a máscara capturou
+                                    # Extrai as cores reais da máscara
                                     pixels = roi_bgr[roi_mask > 0]
-                                    colors_present = set()
+                                    cores_presentes = set()
                                     if len(pixels) > 0:
-                                        colors_present = set(tuple(c) for c in pixels)
-                                        colors_present.discard((255, 255, 255)) # Remove o fundo branco
-                                        colors_present.discard((0, 0, 0))       # Remove ruído preto
-                                        
+                                        # Remove apenas o fundo estritamente branco e preto (ruído da base)
+                                        for p in pixels:
+                                            pt = tuple(p)
+                                            if pt != (255, 255, 255) and pt != (0, 0, 0):
+                                                cores_presentes.add(pt)
+                                                
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     
                                     patim_tdfs.append({
                                         'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
                                         'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
-                                        'odo': center_x_mm, 'colors': colors_present, 'used': False
+                                        'odo': center_x_mm, 'cores': cores_presentes, 'usado': False
                                     })
                                 else:
-                                    # Qualquer outro defeito que não caiu nas regras rigorosas
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
 
-                            # =========================================================
-                            # PROCESSAMENTO DE TDF (PATIM): PARES VS ISOLADOS
-                            # =========================================================
+                            # ========================================================
+                            # APLICAÇÃO DAS REGRAS (PARES E ISOLADOS) NO PATIM
+                            # ========================================================
                             if patim_tdfs:
                                 patim_tdfs.sort(key=lambda x: x['odo'])
                                 
-                                # Condição 1: Busca por Duplas/Pares conjugados
+                                # Regra 1: Pares de cores diferentes (250~350mm, altura > 10mm)
                                 for i in range(len(patim_tdfs)):
-                                    if patim_tdfs[i]['used']: continue
-                                    if patim_tdfs[i]['altura_mm'] < 10: continue
+                                    if patim_tdfs[i]['usado']: continue
+                                    if patim_tdfs[i]['altura_mm'] <= 10: continue
                                     
                                     for j in range(i+1, len(patim_tdfs)):
-                                        if patim_tdfs[j]['used']: continue
-                                        if patim_tdfs[j]['altura_mm'] < 10: continue
+                                        if patim_tdfs[j]['usado']: continue
+                                        if patim_tdfs[j]['altura_mm'] <= 10: continue
                                         
                                         dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
                                         
-                                        if dist > 350: 
-                                            break # Distância excedeu, desiste do loop interno
+                                        if dist > 350:
+                                            break # Distância já excedeu, interrompe loop j
                                             
                                         if 250 <= dist <= 350:
-                                            c1 = patim_tdfs[i]['colors']
-                                            c2 = patim_tdfs[j]['colors']
+                                            c1 = patim_tdfs[i]['cores']
+                                            c2 = patim_tdfs[j]['cores']
                                             
-                                            # Se ambos possuem cores válidas, e essas cores NÃO SÃO iguais
-                                            if c1 and c2 and not c1.intersection(c2):
-                                                patim_tdfs[i]['used'] = True
-                                                patim_tdfs[j]['used'] = True
+                                            # Verifica se há cores detectadas e se os conjuntos de cores não se cruzam
+                                            # (isdisjoint == True significa que são de sondas com cores totalmente diferentes)
+                                            if c1 and c2 and c1.isdisjoint(c2):
+                                                patim_tdfs[i]['usado'] = True
+                                                patim_tdfs[j]['usado'] = True
                                                 
                                                 d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
                                                 
-                                                # Mescla as caixas delimitadoras num retângulo longo
+                                                # Mescla os dois retângulos abrangendo as detecções pares
                                                 new_x1 = min(d1['box'][0], d2['box'][0])
                                                 new_y1 = min(d1['box'][1], d2['box'][1])
                                                 new_x2 = max(d1['box'][2], d2['box'][2])
@@ -515,17 +533,15 @@ def main():
                                                 n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
                                                 
                                                 valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
-                                                break 
+                                                break # Achou o par, pula para a próxima iteração do i
                                                 
-                                # Condição 2: Detecções isoladas severas (independentes do pareamento)
+                                # Regra 2: Detecções Isoladas (altura > 18mm)
+                                # Processa independentemente tudo que sobrou (não formou par)
                                 for item in patim_tdfs:
-                                    if not item['used']:
+                                    if not item['usado']:
                                         if item['altura_mm'] > 18:
                                             valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
 
-                            # =========================================================
-                            # DESENHO DOS BOUNDING BOXES 
-                            # =========================================================
                             if valid_dets:
                                 VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
@@ -543,6 +559,7 @@ def main():
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
+                                    # ODO representa o centro da largura do bounding box detectado
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     
