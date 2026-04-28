@@ -129,8 +129,36 @@ def gerar_zip_dataset():
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÃO REESTRUTURADA V5: PROJEÇÃO DE EIXOS (OVERLAP DE COORDENADAS)
+# FUNÇÕES GEOMÉTRICAS E CLASSIFICAÇÕES
 # =====================================================================
+def calcular_inclinacao(mask_bool, x1, y1, x2, y2):
+    """
+    Calcula a inclinação do objeto segmentado.
+    Retorna "Direita" (/), "Esquerda" (\) ou "Vertical/Indefinida".
+    """
+    roi_mask = mask_bool[y1:y2, x1:x2]
+    pts_y, pts_x = np.where(roi_mask > 0)
+    
+    if len(pts_x) < 5:
+        return "Indefinida"
+    
+    points = np.column_stack((pts_x, pts_y)).astype(np.float32)
+    line = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
+    
+    # Extrai o vetor diretor
+    vx, vy = float(line[0]), float(line[1])
+    
+    # Na imagem (y cresce para baixo), 
+    # vx * vy < 0 indica reta subindo para a direita (/)
+    # vx * vy > 0 indica reta descendo para a direita (\)
+    produto = vx * vy
+    if produto < -0.05:
+        return "Direita"
+    elif produto > 0.05:
+        return "Esquerda"
+    else:
+        return "Vertical"
+
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
     upper_green = np.array([50, 255, 50], dtype=np.uint8)
@@ -445,7 +473,7 @@ def main():
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
                                 
                                 # ========================================================
-                                # FILTRO PATIM: ACUMULADOR DE TDF >= 6mm
+                                # FILTRO PATIM: ACUMULADOR DE TDF >= 6mm COM INCLINAÇÃO
                                 # ========================================================
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
                                     if altura_mm >= 6:
@@ -453,12 +481,15 @@ def main():
                                         tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
                                         tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
                                         
+                                        inclinacao_calc = calcular_inclinacao(d['mask'], x1_orig, y1_orig, x2_orig, y2_orig)
+                                        
                                         center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                         
                                         side_patim_tdfs.append({
                                             'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
                                             'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
                                             'odo': center_x_mm, 'tem_verde': tem_verde, 'tem_roxo': tem_roxo, 
+                                            'inclinacao': inclinacao_calc,
                                             'usado': False, 'x1': x1_orig, 'y1': y1_orig, 'x2': x2_orig, 'y2': y2_orig,
                                             'start': start
                                         })
@@ -475,7 +506,8 @@ def main():
                         })
 
                 # ========================================================
-                # ASSOCIAÇÃO GLOBAL: TDF CONJUGADO (DUPLAS DE CORES DIFERENTES)
+                # ASSOCIAÇÃO GLOBAL: TDF CONJUGADO 
+                # (DUPLAS DE CORES, ALTURA E INCLINAÇÕES ESPECÍFICAS)
                 # ========================================================
                 if local_nome == 'Patim' and side_patim_tdfs:
                     side_patim_tdfs.sort(key=lambda x: x['odo'])
@@ -487,24 +519,30 @@ def main():
                             if side_patim_tdfs[j]['usado']: continue
                             
                             dist = abs(side_patim_tdfs[j]['odo'] - side_patim_tdfs[i]['odo'])
-                            if dist > 320: break # Distância superada, interrompe varredura desse i
+                            if dist > 320: break 
                                 
                             if 200 <= dist <= 300:
                                 v1, r1 = side_patim_tdfs[i]['tem_verde'], side_patim_tdfs[i]['tem_roxo']
                                 v2, r2 = side_patim_tdfs[j]['tem_verde'], side_patim_tdfs[j]['tem_roxo']
                                 h1 = side_patim_tdfs[i]['altura_mm']
                                 h2 = side_patim_tdfs[j]['altura_mm']
+                                inc1 = side_patim_tdfs[i]['inclinacao']
+                                inc2 = side_patim_tdfs[j]['inclinacao']
                                 
-                                # Validação: Cores diferentes (Verde/Roxo) e pelo menos um deles com >= 10mm
-                                par_valido = ((v1 and r2) or (r1 and v2)) and (h1 >= 10 or h2 >= 10)
+                                # Condições da Dupla
+                                cores_validas = ((v1 and r2) or (r1 and v2))
+                                altura_valida = (h1 >= 10 or h2 >= 10)
+                                # Primeiro para a direita (/), segundo para a esquerda (\)
+                                inclinacao_valida = (inc1 == "Direita" and inc2 == "Esquerda")
+                                
+                                par_valido = cores_validas and altura_valida and inclinacao_valida
                                 
                                 if par_valido:
                                     side_patim_tdfs[i]['usado'] = True
                                     side_patim_tdfs[j]['usado'] = True
-                                    dist_inteiro = int(dist) # Grava a distância em mm calculada
+                                    dist_inteiro = int(dist) 
                                     
                                     if side_patim_tdfs[i]['start'] == side_patim_tdfs[j]['start']:
-                                        # Mesma imagem: Funde o retângulo
                                         d1, d2 = side_patim_tdfs[i]['d'], side_patim_tdfs[j]['d']
                                         new_x1 = min(side_patim_tdfs[i]['x1'], side_patim_tdfs[j]['x1'])
                                         new_y1 = min(side_patim_tdfs[i]['y1'], side_patim_tdfs[j]['y1'])
@@ -528,7 +566,6 @@ def main():
                                                 w['other_dets'].append({'d': new_d, 'largura_mm': n_largura_mm, 'altura_mm': n_altura_mm, 'px1': n_px1, 'px2': n_px2, 'py1': n_py1, 'py2': n_py2})
                                                 break
                                     else:
-                                        # Imagens diferentes: Etiqueta individualmente com a distância, sem mesclar caixas
                                         side_patim_tdfs[i]['d']['cls_nome'] = 'TDF_Conjugado'
                                         side_patim_tdfs[i]['d']['dist_par'] = dist_inteiro
                                         side_patim_tdfs[j]['d']['cls_nome'] = 'TDF_Conjugado'
