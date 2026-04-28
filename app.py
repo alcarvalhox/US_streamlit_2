@@ -489,7 +489,7 @@ def main():
                             dist = abs(side_patim_tdfs[j]['odo'] - side_patim_tdfs[i]['odo'])
                             if dist > 320: break # Distância superada, interrompe varredura desse i
                                 
-                            if 180 <= dist <= 300:
+                            if 200 <= dist <= 300:
                                 v1, r1 = side_patim_tdfs[i]['tem_verde'], side_patim_tdfs[i]['tem_roxo']
                                 v2, r2 = side_patim_tdfs[j]['tem_verde'], side_patim_tdfs[j]['tem_roxo']
                                 h1 = side_patim_tdfs[i]['altura_mm']
@@ -515,7 +515,7 @@ def main():
                                         new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
                                         new_d['mask'] = d1['mask'] | d2['mask']
                                         new_d['cls_nome'] = 'TDF_Conjugado'
-                                        new_d['dist_par'] = dist_inteiro # Adiciona a propriedade de distância na detecção
+                                        new_d['dist_par'] = dist_inteiro 
                                         
                                         h_img, w_img = side_windows[0]['img_clean'].shape[:2]
                                         n_px1, n_px2 = new_x1/w_img, new_x2/w_img
@@ -541,10 +541,10 @@ def main():
                                                 w['other_dets'].append({'d': side_patim_tdfs[j]['d'], 'largura_mm': side_patim_tdfs[j]['largura_mm'], 'altura_mm': side_patim_tdfs[j]['altura_mm'], 'px1': side_patim_tdfs[j]['px1'], 'px2': side_patim_tdfs[j]['px2'], 'py1': side_patim_tdfs[j]['py1'], 'py2': side_patim_tdfs[j]['py2']})
                                     break
                                     
-                    # Re-adiciona TDFs isolados restantes (desde que sejam >= 10mm)
+                    # Re-adiciona TDFs isolados restantes (desde que sejam > 18mm)
                     for item in side_patim_tdfs:
                         if not item['usado']:
-                            if item['altura_mm'] >= 10:
+                            if item['altura_mm'] > 18:
                                 for w in side_windows:
                                     if w['start'] == item['start']:
                                         w['other_dets'].append({'d': item['d'], 'largura_mm': item['largura_mm'], 'altura_mm': item['altura_mm'], 'px1': item['px1'], 'px2': item['px2'], 'py1': item['py1'], 'py2': item['py2']})
