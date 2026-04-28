@@ -435,6 +435,7 @@ def main():
                                 altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
+                                # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     if largura_mm <= 130 or altura_mm <= 15:
                                         continue
@@ -451,6 +452,11 @@ def main():
                                     tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
                                     tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
                                     if not (tem_verde and tem_roxo):
+                                        continue
+                                
+                                # Filtro 2: PATIM (TDF)
+                                if local_nome == 'Patim' and d['cls_nome'] == 'TDF':
+                                    if altura_mm < 10:
                                         continue
                                         
                                 valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
@@ -472,6 +478,7 @@ def main():
                                     cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                                     cv2.putText(img_draw, f"#{local_id} {d['cls_nome']}", (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
                                     
+                                    # ODO representa o centro da largura do bounding box detectado
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
                                     
@@ -481,8 +488,8 @@ def main():
                                         'Local': local_nome, 
                                         'Lado': lado_nome, 
                                         'Classe': d['cls_nome'], 
+                                        'ODO': int(center_x_mm),
                                         'ODO_Ref': start,
-                                        'Coordenada ODO(mm)': int(center_x_mm),
                                         'Coordenada Depth(mm)': int(center_y_mm),
                                         'Largura(mm)': largura_mm,
                                         'Altura(mm)': altura_mm,
@@ -645,13 +652,13 @@ def main():
                         
                         if not df_imagem_atual.empty:
                             edited_df = st.data_editor(
-                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
+                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'ODO', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
                                 column_config={
                                     "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
                                     "ID_Global": None, 
                                     "ID_Img": st.column_config.TextColumn("Ref")
                                 },
-                                disabled=['ID_Img', 'Classe', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
+                                disabled=['ID_Img', 'Classe', 'ODO', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
                                 hide_index=True,
                                 key=f"editor_img_{local_selecionado}_{img_idx}" 
                             )
