@@ -132,10 +132,8 @@ def gerar_zip_dataset():
 # =====================================================================
 def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     """
-    Identifica BHC apenas se duas massas da mesma cor coexistirem no mesmo 
-    espaço horizontal (Eixo X) com separação vertical (Eixo Y). Ignora curvas quebradas.
+    Identifica BHC na Alma se duas massas (verde/roxo) coexistirem no mesmo espaço horizontal.
     """
-    # 1. Filtro de Cores
     lower_green = np.array([0, 100, 0], dtype=np.uint8)
     upper_green = np.array([50, 255, 50], dtype=np.uint8)
     mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
@@ -148,7 +146,6 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
     mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
 
-    # 2. Fechamento Morfológico (Funde apenas os pontos da mesma linha de US)
     kernel = np.ones((9, 9), np.uint8)
     mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
     mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
@@ -156,7 +153,6 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
     contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # 3. Motor Geométrico B-Scan (Sobreposição Horizontal)
     def tem_sobreposicao_vertical_exata(contours):
         valid_c = [c for c in contours if cv2.contourArea(c) > 40]
         if len(valid_c) < 2: return False
@@ -448,26 +444,37 @@ def main():
                                         
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
                                 
-                                # Filtro 2: PATIM (Buffer de TDFs para analise de Pares)
+                                # Filtro 2: PATIM (Buffer Dinâmico de Cores para TDFs)
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
-                                    tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
-                                    tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
+                                    roi_mask = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
+                                    
+                                    # Mapeia dinamicamente as cores reais que a máscara capturou
+                                    pixels = roi_bgr[roi_mask > 0]
+                                    colors_present = set()
+                                    if len(pixels) > 0:
+                                        colors_present = set(tuple(c) for c in pixels)
+                                        colors_present.discard((255, 255, 255)) # Remove o fundo branco
+                                        colors_present.discard((0, 0, 0))       # Remove ruído preto
+                                        
                                     center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
                                     
                                     patim_tdfs.append({
                                         'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
                                         'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
-                                        'odo': center_x_mm, 'tem_verde': tem_verde, 'tem_roxo': tem_roxo, 'used': False
+                                        'odo': center_x_mm, 'colors': colors_present, 'used': False
                                     })
                                 else:
+                                    # Qualquer outro defeito que não caiu nas regras rigorosas
                                     valid_dets.append((d, largura_mm, altura_mm, px1, px2, py1, py2))
 
-                            # PROCESSAMENTO DE PARES TDF (PATIM)
+                            # =========================================================
+                            # PROCESSAMENTO DE TDF (PATIM): PARES VS ISOLADOS
+                            # =========================================================
                             if patim_tdfs:
                                 patim_tdfs.sort(key=lambda x: x['odo'])
                                 
-                                # 1. Busca por duplas (TDF Pareado/Conjugado)
+                                # Condição 1: Busca por Duplas/Pares conjugados
                                 for i in range(len(patim_tdfs)):
                                     if patim_tdfs[i]['used']: continue
                                     if patim_tdfs[i]['altura_mm'] < 10: continue
@@ -479,20 +486,20 @@ def main():
                                         dist = abs(patim_tdfs[j]['odo'] - patim_tdfs[i]['odo'])
                                         
                                         if dist > 350: 
-                                            break # Como está ordenado, os próximos serão ainda mais longe
+                                            break # Distância excedeu, desiste do loop interno
                                             
                                         if 250 <= dist <= 350:
-                                            # Verifica se são de cores diferentes (uma responde a verde, outra a roxo)
-                                            v1, r1 = patim_tdfs[i]['tem_verde'], patim_tdfs[i]['tem_roxo']
-                                            v2, r2 = patim_tdfs[j]['tem_verde'], patim_tdfs[j]['tem_roxo']
+                                            c1 = patim_tdfs[i]['colors']
+                                            c2 = patim_tdfs[j]['colors']
                                             
-                                            if (v1 and r2) or (r1 and v2):
+                                            # Se ambos possuem cores válidas, e essas cores NÃO SÃO iguais
+                                            if c1 and c2 and not c1.intersection(c2):
                                                 patim_tdfs[i]['used'] = True
                                                 patim_tdfs[j]['used'] = True
                                                 
                                                 d1, d2 = patim_tdfs[i]['d'], patim_tdfs[j]['d']
                                                 
-                                                # Mescla as duas detecções em um único retângulo
+                                                # Mescla as caixas delimitadoras num retângulo longo
                                                 new_x1 = min(d1['box'][0], d2['box'][0])
                                                 new_y1 = min(d1['box'][1], d2['box'][1])
                                                 new_x2 = max(d1['box'][2], d2['box'][2])
@@ -500,7 +507,7 @@ def main():
                                                 
                                                 new_d = d1.copy()
                                                 new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
-                                                new_d['mask'] = d1['mask'] | d2['mask'] # Junta as máscaras para refinar
+                                                new_d['mask'] = d1['mask'] | d2['mask']
                                                 
                                                 n_px1, n_px2 = new_x1/w_img, new_x2/w_img
                                                 n_py1, n_py2 = new_y1/h_img, new_y2/h_img
@@ -508,15 +515,17 @@ def main():
                                                 n_altura_mm = int(abs(n_py2 - n_py1) * altura_fisica_ref)
                                                 
                                                 valid_dets.append((new_d, n_largura_mm, n_altura_mm, n_px1, n_px2, n_py1, n_py2))
-                                                break # Dupla encontrada, vai para o próximo i
+                                                break 
                                                 
-                                # 2. Processa as detecções isoladas que sobraram
+                                # Condição 2: Detecções isoladas severas (independentes do pareamento)
                                 for item in patim_tdfs:
                                     if not item['used']:
                                         if item['altura_mm'] > 18:
                                             valid_dets.append((item['d'], item['largura_mm'], item['altura_mm'], item['px1'], item['px2'], item['py1'], item['py2']))
 
-                            # DESENHO E CONSTRUÇÃO DOS METADADOS FINAIS
+                            # =========================================================
+                            # DESENHO DOS BOUNDING BOXES 
+                            # =========================================================
                             if valid_dets:
                                 VIS_W, VIS_H = 2400, 400
                                 img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
