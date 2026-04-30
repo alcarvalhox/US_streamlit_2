@@ -457,7 +457,7 @@ def main():
                                 
                                 # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
-                                    if largura_mm <= 130 or altura_mm <= 15:
+                                    if largura_mm <= 110 or altura_mm <= 15:
                                         continue
                                         
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
