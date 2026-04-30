@@ -396,7 +396,7 @@ def main():
                         img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                         img_clean = img_base.copy()
                         
-                        results = model.predict(img_clean, verbose=False, conf=0.05, iou=0.85, imgsz=1536)
+                        results = model.predict(img_clean, verbose=False, conf=0.05, iou=0.85)
                         
                         valid_dets = []
                         if len(results[0].boxes) > 0:
@@ -457,8 +457,8 @@ def main():
                                 
                                 # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
-                                    if largura_mm <= 110 or altura_mm <= 15:
-                                        continue
+                                    #if largura_mm <= 110 or altura_mm <= 15:
+                                    #    continue
                                         
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
