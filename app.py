@@ -455,6 +455,7 @@ def main():
                                 
                                
                                 # Filtro 1: ALMA (Furos)
+                                # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     
                                     # REQUISITO 4: Range estrito em Alma de 80 a 120 de Profundidade
@@ -468,14 +469,16 @@ def main():
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # CORREÇÃO: "Apagar" tudo na caixa que não faz parte da detecção do YOLO
+                                    # "Apagar" tudo na caixa que não faz parte da detecção do YOLO
                                     roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
                                     
-                                    # REQUISITO 1: Exigir presença das DUAS cores APENAS dentro da máscara
-                                    tem_verde = np.any(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))
-                                    tem_roxo = np.any(np.all(roi_bgr_mascarado == [128, 0, 128], axis=-1))
+                                    # CORREÇÃO: Contar a massa de pixels exatos em vez de verificar existência
+                                    qtd_verde = np.sum(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))
+                                    qtd_roxo = np.sum(np.all(roi_bgr_mascarado == [128, 0, 128], axis=-1))
                                     
-                                    if not (tem_verde and tem_roxo):
+                                    # REQUISITO 1: Exigir uma MASSA mínima de 20 pixels de CADA cor para validar
+                                    limite_pixels = 20
+                                    if qtd_verde < limite_pixels or qtd_roxo < limite_pixels:
                                         continue
                                     
                                     classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
