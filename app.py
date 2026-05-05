@@ -457,6 +457,7 @@ def main():
                                 # Filtro 1: ALMA (Furos)
                                 # Filtro 1: ALMA (Furos)
                                 # Filtro 1: ALMA (Furos)
+                                # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     
                                     # REQUISITO 4: Range estrito em Alma de 80 a 120 de Profundidade
@@ -470,53 +471,30 @@ def main():
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # "Apagar" tudo na caixa que não faz parte da detecção do YOLO
+                                    # Mantém o mascaramento da Bounding Box (olha apenas para o desenho da IA)
                                     roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
                                     
-                                    # Criar máscaras booleanas exatas para o Verde e o Roxo
-                                    mask_verde = np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1)
-                                    mask_roxo = np.all(roi_bgr_mascarado == [128, 0, 128], axis=-1)
+                                    # Isola as cores exatas
+                                    lower_green = np.array([0, 100, 0], dtype=np.uint8)
+                                    upper_green = np.array([50, 255, 50], dtype=np.uint8)
+                                    mask_verde = cv2.inRange(roi_bgr_mascarado, lower_green, upper_green)
+
+                                    lower_purple = np.array([100, 0, 100], dtype=np.uint8)
+                                    upper_purple = np.array([180, 50, 180], dtype=np.uint8)
+                                    mask_roxa = cv2.inRange(roi_bgr_mascarado, lower_purple, upper_purple)
                                     
-                                    qtd_verde = np.sum(mask_verde)
-                                    qtd_roxo = np.sum(mask_roxo)
+                                    # NOVA SOLUÇÃO ANTI-RUÍDO: Erosão Morfológica
+                                    # "Lixa" as máscaras. Pixels soltos (ruído) somem. Blocos sólidos (furos) sobrevivem.
+                                    kernel = np.ones((3, 3), np.uint8)
+                                    mask_verde_limpa = cv2.erode(mask_verde, kernel, iterations=1)
+                                    mask_roxa_limpa = cv2.erode(mask_roxa, kernel, iterations=1)
                                     
-                                    # REQUISITO 1: Exigir uma MASSA mínima de 20 pixels
-                                    limite_pixels = 20
-                                    if qtd_verde < limite_pixels or qtd_roxo < limite_pixels:
+                                    # Verifica se, após a erosão, ainda sobrou massa real de ambas as cores
+                                    tem_verde = np.any(mask_verde_limpa)
+                                    tem_roxo = np.any(mask_roxa_limpa)
+                                    
+                                    if not (tem_verde and tem_roxo):
                                         continue
-                                        
-                                    # ========================================================
-                                    # NOVAS REGRAS ANTI-RUÍDO (Análise Geométrica Estrutural)
-                                    # ========================================================
-                                    
-                                    # Regra A: Densidade da Máscara (Fill Ratio)
-                                    # Um Furo real (arco) deixa muita área branca na Bounding Box.
-                                    # Ruídos são blocos maciços densos.
-                                    area_bbox = max(1, (x2_orig - x1_orig) * (y2_orig - y1_orig))
-                                    area_mascara_total = np.sum(roi_mask_bool)
-                                    densidade = area_mascara_total / area_bbox
-                                    
-                                    if densidade > 0.45: # Se a máscara preencher mais de 45% do retângulo, é ruído!
-                                        continue
-                                        
-                                    # Regra B: Separação Espacial (Centróides X)
-                                    # Furos têm a massa verde separada lateralmente da massa roxa.
-                                    pts_v_y, pts_v_x = np.where(mask_verde)
-                                    pts_p_y, pts_p_x = np.where(mask_roxo)
-                                    
-                                    if len(pts_v_x) > 0 and len(pts_p_x) > 0:
-                                        cx_verde = np.mean(pts_v_x)
-                                        cx_roxo = np.mean(pts_p_x)
-                                        
-                                        dist_x_centros = abs(cx_verde - cx_roxo)
-                                        largura_box_px = max(1, x2_orig - x1_orig)
-                                        
-                                        # Se a distância entre o meio do verde e o meio do roxo for menor
-                                        # que 15% da largura da caixa, eles estão caoticamente misturados.
-                                        if dist_x_centros < (largura_box_px * 0.15):
-                                            continue
-                                            
-                                    # ========================================================
                                     
                                     classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
                                     d['cls_nome'] = classe_refinada
@@ -525,7 +503,6 @@ def main():
                                         d['cls_id'] = 99 
                                         
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
-                                
                                 # ========================================================
                                 # FILTRO PATIM: ACUMULADOR DE TDF >= 6mm COM INCLINAÇÃO
                                 # ========================================================
