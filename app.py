@@ -456,6 +456,7 @@ def main():
                                
                                 # Filtro 1: ALMA (Furos)
                                 # Filtro 1: ALMA (Furos)
+                                # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     
                                     # REQUISITO 4: Range estrito em Alma de 80 a 120 de Profundidade
@@ -472,14 +473,50 @@ def main():
                                     # "Apagar" tudo na caixa que não faz parte da detecção do YOLO
                                     roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
                                     
-                                    # CORREÇÃO: Contar a massa de pixels exatos em vez de verificar existência
-                                    qtd_verde = np.sum(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))
-                                    qtd_roxo = np.sum(np.all(roi_bgr_mascarado == [128, 0, 128], axis=-1))
+                                    # Criar máscaras booleanas exatas para o Verde e o Roxo
+                                    mask_verde = np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1)
+                                    mask_roxo = np.all(roi_bgr_mascarado == [128, 0, 128], axis=-1)
                                     
-                                    # REQUISITO 1: Exigir uma MASSA mínima de 20 pixels de CADA cor para validar
+                                    qtd_verde = np.sum(mask_verde)
+                                    qtd_roxo = np.sum(mask_roxo)
+                                    
+                                    # REQUISITO 1: Exigir uma MASSA mínima de 20 pixels
                                     limite_pixels = 20
                                     if qtd_verde < limite_pixels or qtd_roxo < limite_pixels:
                                         continue
+                                        
+                                    # ========================================================
+                                    # NOVAS REGRAS ANTI-RUÍDO (Análise Geométrica Estrutural)
+                                    # ========================================================
+                                    
+                                    # Regra A: Densidade da Máscara (Fill Ratio)
+                                    # Um Furo real (arco) deixa muita área branca na Bounding Box.
+                                    # Ruídos são blocos maciços densos.
+                                    area_bbox = max(1, (x2_orig - x1_orig) * (y2_orig - y1_orig))
+                                    area_mascara_total = np.sum(roi_mask_bool)
+                                    densidade = area_mascara_total / area_bbox
+                                    
+                                    if densidade > 0.45: # Se a máscara preencher mais de 45% do retângulo, é ruído!
+                                        continue
+                                        
+                                    # Regra B: Separação Espacial (Centróides X)
+                                    # Furos têm a massa verde separada lateralmente da massa roxa.
+                                    pts_v_y, pts_v_x = np.where(mask_verde)
+                                    pts_p_y, pts_p_x = np.where(mask_roxo)
+                                    
+                                    if len(pts_v_x) > 0 and len(pts_p_x) > 0:
+                                        cx_verde = np.mean(pts_v_x)
+                                        cx_roxo = np.mean(pts_p_x)
+                                        
+                                        dist_x_centros = abs(cx_verde - cx_roxo)
+                                        largura_box_px = max(1, x2_orig - x1_orig)
+                                        
+                                        # Se a distância entre o meio do verde e o meio do roxo for menor
+                                        # que 15% da largura da caixa, eles estão caoticamente misturados.
+                                        if dist_x_centros < (largura_box_px * 0.15):
+                                            continue
+                                            
+                                    # ========================================================
                                     
                                     classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
                                     d['cls_nome'] = classe_refinada
