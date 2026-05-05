@@ -145,16 +145,11 @@ def calcular_inclinacao(mask_bool, x1, y1, x2, y2):
     points = np.column_stack((pts_x, pts_y)).astype(np.float32)
     line = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
     
-    # Trava de segurança caso o OpenCV não consiga traçar a reta
     if line is None:
         return "Indefinida"
     
-    # Extrai o vetor diretor acessando o valor interno do array
     vx, vy = float(line[0][0]), float(line[1][0])
     
-    # Na imagem (y cresce para baixo), 
-    # vx * vy < 0 indica reta subindo para a direita (/)
-    # vx * vy > 0 indica reta descendo para a direita (\)
     produto = vx * vy
     if produto < -0.05:
         return "Direita"
@@ -223,6 +218,7 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
                         return True
         return False
 
+    # REQUISITO 3: Somente quando existirem retas paralelas verde-verde E roxo-roxo
     if tem_sobreposicao_vertical_exata(contours_v) or tem_sobreposicao_vertical_exata(contours_p):
         return 'BHC'
     
@@ -433,7 +429,9 @@ def main():
                                     if xr > xl and yb > yt:
                                         area_inter = (xr-xl)*(yb-yt)
                                         area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
-                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else 0.40 
+                                        
+                                        # REQUISITO 2: NMS mais agressivo para a classe Furo (0.20) para mesclar sub-caixas
+                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else (0.20 if d['cls_nome'] == 'Furo' else 0.40)
                                         
                                         if (area_inter / area_min) > limite_nms:
                                             if d['cls_id'] == f['cls_id']:
@@ -457,10 +455,23 @@ def main():
                                 
                                 # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
+                                    
+                                    # REQUISITO 4: Range estrito em Alma de 80 a 120 de Profundidade
+                                    center_y_mm_calc = min_depth + delta_depth * (py1 + py2) / 2.0
+                                    if not (80 <= center_y_mm_calc <= 120):
+                                        continue
+                                    
                                     if largura_mm <= 110 or altura_mm <= 13:
                                         continue
                                         
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
+                                    
+                                    # REQUISITO 1: Exigir presença das DUAS cores no bounding box ANTES de qualificar BHC/Furo
+                                    tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
+                                    tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
+                                    if not (tem_verde and tem_roxo):
+                                        continue
+                                    
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
                                     classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
@@ -468,11 +479,6 @@ def main():
                                     
                                     if classe_refinada == 'BHC':
                                         d['cls_id'] = 99 
-
-                                    tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
-                                    tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
-                                    if not (tem_verde and tem_roxo):
-                                        continue
                                         
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
                                 
