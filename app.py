@@ -453,6 +453,7 @@ def main():
                                 altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
+                               
                                 # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     
@@ -465,14 +466,17 @@ def main():
                                         continue
                                         
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
+                                    roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # REQUISITO 1: Exigir presença das DUAS cores no bounding box ANTES de qualificar BHC/Furo
-                                    tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
-                                    tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
+                                    # CORREÇÃO: "Apagar" tudo na caixa que não faz parte da detecção do YOLO
+                                    roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
+                                    
+                                    # REQUISITO 1: Exigir presença das DUAS cores APENAS dentro da máscara
+                                    tem_verde = np.any(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))
+                                    tem_roxo = np.any(np.all(roi_bgr_mascarado == [128, 0, 128], axis=-1))
+                                    
                                     if not (tem_verde and tem_roxo):
                                         continue
-                                    
-                                    roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
                                     classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
                                     d['cls_nome'] = classe_refinada
