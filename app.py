@@ -229,7 +229,7 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
 # =====================================================================
 def main():
     st.set_page_config(
-        page_title="Detecção automática de defeitos de inspeções de US", 
+        page_title="Detecção automática de defeitos em inspeções de US", 
         page_icon="logo.png", 
         layout="wide"
     )
