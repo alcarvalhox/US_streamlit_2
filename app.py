@@ -49,7 +49,6 @@ from scipy.spatial import cKDTree
 # =====================================================================
 # 1. CONFIGURAÇÕES GLOBAIS E FUNÇÕES BASE
 # =====================================================================
-# CONFIGURAÇÃO ALTERADA: Suporte a listas de modelos por região
 CONFIG_MODELOS = {
     "Alma": ["best_alma_3.pt"],
     "Boleto": ["best_boleto_1.pt", "best_patim_1.pt"],
@@ -133,10 +132,6 @@ def gerar_zip_dataset():
 # FUNÇÕES GEOMÉTRICAS E CLASSIFICAÇÕES
 # =====================================================================
 def calcular_inclinacao(mask_bool, x1, y1, x2, y2):
-    """
-    Calcula a inclinação do objeto segmentado.
-    Retorna "Direita" (/), "Esquerda" (\) ou "Vertical/Indefinida".
-    """
     roi_mask = mask_bool[y1:y2, x1:x2]
     pts_y, pts_x = np.where(roi_mask > 0)
     
@@ -380,7 +375,6 @@ def main():
             for lado_nome, df_side in lados:
                 if df_side.empty: continue
                 
-                # Variáveis para agregação e processamento global de TDFs por lado
                 side_windows = []
                 side_patim_tdfs = []
                 
@@ -415,7 +409,7 @@ def main():
                                         
                                     cls_nome = model.names[int(box.cls)]
                                     
-                                    # REQUISITO: Renomear TDF para TD quando a inferência for realizada no Boleto
+                                    # Renomear TDF para TD no Boleto
                                     if local_nome == 'Boleto' and cls_nome == 'TDF':
                                         cls_nome = 'TD'
                                         
@@ -445,7 +439,6 @@ def main():
                                         limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else (0.20 if d['cls_nome'] == 'Furo' else 0.40)
                                         
                                         if (area_inter / area_min) > limite_nms:
-                                            # Modificado de cls_id para cls_nome para evitar colisão entre modelos
                                             if d['cls_nome'] == f['cls_nome']:
                                                 f['box'][0] = min(bx1[0], bx2[0])
                                                 f['box'][1] = min(bx1[1], bx2[1])
@@ -464,6 +457,28 @@ def main():
                                 largura_mm = int(abs(px2 - px1) * 2400)
                                 altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
+                                
+                                # ========================================================
+                                # REGRAS PARA TD NO BOLETO: Altura >= 8mm e Cor (Vermelho, Azul ou Verde)
+                                # ========================================================
+                                if local_nome == 'Boleto' and d['cls_nome'] == 'TD':
+                                    if altura_mm < 8:
+                                        continue
+                                        
+                                    roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
+                                    roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
+                                    
+                                    # Aplica a máscara para garantir que estamos olhando apenas para os pixels do TD
+                                    roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
+                                    
+                                    # Verifica se existe pelo menos um pixel de alguma das cores alvo na máscara
+                                    tem_vermelho = np.any(np.all(roi_bgr_mascarado == [0, 0, 255], axis=-1))  # BGR: Red
+                                    tem_azul = np.any(np.all(roi_bgr_mascarado == [255, 0, 0], axis=-1))      # BGR: Blue
+                                    tem_verde = np.any(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))     # BGR: Green (Probe 6/7)
+                                    
+                                    # Se a detecção não tiver nenhuma dessas cores, é descartada
+                                    if not (tem_vermelho or tem_azul or tem_verde):
+                                        continue
                                 
                                 # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
@@ -492,10 +507,10 @@ def main():
                                     mask_verde_limpa = cv2.erode(mask_verde, kernel, iterations=1)
                                     mask_roxa_limpa = cv2.erode(mask_roxa, kernel, iterations=1)
                                     
-                                    tem_verde = np.any(mask_verde_limpa)
-                                    tem_roxo = np.any(mask_roxa_limpa)
+                                    tem_verde_furo = np.any(mask_verde_limpa)
+                                    tem_roxo_furo = np.any(mask_roxa_limpa)
                                     
-                                    if not (tem_verde and tem_roxo):
+                                    if not (tem_verde_furo and tem_roxo_furo):
                                         continue
                                     
                                     classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
