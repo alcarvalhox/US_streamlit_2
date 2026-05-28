@@ -49,7 +49,6 @@ from scipy.spatial import cKDTree
 # =====================================================================
 # 1. CONFIGURAÇÕES GLOBAIS E FUNÇÕES BASE
 # =====================================================================
-# ATUALIZAÇÃO: best_patim_1.pt inserido também na Alma
 CONFIG_MODELOS = {
     "Alma": ["best_alma_3.pt", "best_patim_1.pt"],
     "Boleto": ["best_boleto_1.pt", "best_patim_1.pt"],
@@ -100,20 +99,16 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    # Tratamento para fundir os pontos e melhorar os agrupamentos coloridos
-    size_x = 30  
-    size_y = 15  
+    # TAMANHO ORIGINAL DOS TRIÂNGULOS (Sem tratamento de imagem adicional)
+    size_x = 10
+    size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
     
     for x, y, p in zip(x_coords, y_coords, probes):
         if 0 <= x < width and 0 <= y < height:
             cv2.fillPoly(img, [base_triangle + [x, y]], probe_to_bgr.get(p, (0, 255, 255)))
             
-    kernel_dilatacao = np.ones((7, 7), np.uint8) 
-    img_tratada = cv2.dilate(img, kernel_dilatacao, iterations=2)
-    img_tratada = cv2.GaussianBlur(img_tratada, (5, 5), 0)
-    
-    return img_tratada
+    return img
 
 def gerar_zip_dataset():
     zip_buffer = io.BytesIO()
@@ -553,9 +548,10 @@ def main():
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
 
                         # ========================================================
-                        # NOVA REGRA ALMA: Descartar TD se estiver dentro de Furo ou BHC
+                        # REGRA ALMA: Descartar TD se estiver dentro de Furo ou BHC
                         # ========================================================
                         if local_nome == 'Alma' and len(valid_dets) > 0:
+                            # Primeiro, mapeamos todos os Bounding Boxes de Furos e BHCs validados
                             furo_bhc_boxes = [v['d']['box'] for v in valid_dets if v['d']['cls_nome'] in ['Furo', 'BHC']]
                             
                             filtered_dets = []
@@ -563,12 +559,13 @@ def main():
                                 manter = True
                                 if v['d']['cls_nome'] == 'TD':
                                     bx_td = v['d']['box']
-                                    # Ponto central exato do defeito TD
+                                    # Ponto central exato da detecção do TD
                                     cx_td = (bx_td[0] + bx_td[2]) / 2.0
                                     cy_td = (bx_td[1] + bx_td[3]) / 2.0
                                     
+                                    # Compara o centro do TD contra todas as caixas de Furo/BHC
                                     for bx_furo in furo_bhc_boxes:
-                                        # Verifica se o centro do TD cai dentro dos limites do Furo/BHC
+                                        # Se o X e o Y do centro do TD estiverem dentro do limite do Furo, descarta o TD
                                         if bx_furo[0] <= cx_td <= bx_furo[2] and bx_furo[1] <= cy_td <= bx_furo[3]:
                                             manter = False
                                             break
