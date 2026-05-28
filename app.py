@@ -475,22 +475,42 @@ def main():
                                     if not (tem_vermelho or tem_azul or tem_verde):
                                         continue
                                     
-                                    # [MECANISMO NOVO DE DEFESA] 
-                                    # Se o TD estiver na Alma, com profundidade de Furo e tiver as cores do Furo (Verde e Roxo), ele é um Furo falso e será destruído aqui.
+                                    # ========================================================
+                                    # NOVA REGRA: Detecção de Furo Antagônico (Mata Falsos TDs na Alma)
+                                    # ========================================================
+                                    eh_falso_td_furo = False
                                     if local_nome == 'Alma':
-                                        center_y_mm_calc = min_depth + delta_depth * (py1 + py2) / 2.0
-                                        if 80 <= center_y_mm_calc <= 120:
-                                            lower_green = np.array([0, 100, 0], dtype=np.uint8)
-                                            upper_green = np.array([50, 255, 50], dtype=np.uint8)
-                                            mask_verde_td = cv2.inRange(roi_bgr_mascarado, lower_green, upper_green)
-
-                                            lower_purple = np.array([100, 0, 100], dtype=np.uint8)
-                                            upper_purple = np.array([180, 50, 180], dtype=np.uint8)
-                                            mask_roxa_td = cv2.inRange(roi_bgr_mascarado, lower_purple, upper_purple)
+                                        # Centro X do TD em pixels
+                                        cx = int((x1_orig + x2_orig) / 2.0)
+                                        
+                                        # Distância de 180mm convertida para pixels na imagem (1500px representam 2400mm)
+                                        dx_px = int(180 * (w_img / 2400.0))
+                                        
+                                        # Define a janela horizontal de 180mm para trás e para frente
+                                        x_win_start = max(0, cx - dx_px)
+                                        x_win_end = min(w_img, cx + dx_px)
+                                        
+                                        # Define uma janela vertical folgada pegando a área ao redor da detecção
+                                        y_win_start = max(0, y1_orig - 40)
+                                        y_win_end = min(h_img, y2_orig + 40)
+                                        
+                                        # Extrai o pedaço da imagem limpa e crua onde deve existir o furo
+                                        janela_busca = img_clean[y_win_start:y_win_end, x_win_start:x_win_end]
+                                        
+                                        # Verifica se existem PONTOS VERDES E PONTOS ROXOS simultaneamente nessa janela de 180mm
+                                        lower_green = np.array([0, 100, 0], dtype=np.uint8)
+                                        upper_green = np.array([50, 255, 50], dtype=np.uint8)
+                                        mask_v_antag = cv2.inRange(janela_busca, lower_green, upper_green)
+                                        
+                                        lower_purple = np.array([100, 0, 100], dtype=np.uint8)
+                                        upper_purple = np.array([180, 50, 180], dtype=np.uint8)
+                                        mask_p_antag = cv2.inRange(janela_busca, lower_purple, upper_purple)
+                                        
+                                        if np.any(mask_v_antag) and np.any(mask_p_antag):
+                                            eh_falso_td_furo = True # As duas cores de sondas opostas estão aqui: É um furo.
                                             
-                                            kernel = np.ones((3, 3), np.uint8)
-                                            if np.any(cv2.erode(mask_verde_td, kernel, iterations=1)) and np.any(cv2.erode(mask_roxa_td, kernel, iterations=1)):
-                                                continue 
+                                    if eh_falso_td_furo:
+                                        continue # O "continue" aqui destrói a detecção de TD imediatamente
                                                 
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
                                 
@@ -561,7 +581,7 @@ def main():
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
 
                         # ========================================================
-                        # [MECANISMO NOVO DE DEFESA] SOBREPOSIÇÃO GEOMÉTRICA NA ALMA
+                        # SOBREPOSIÇÃO GEOMÉTRICA NA ALMA (Mantido como segurança)
                         # ========================================================
                         if local_nome == 'Alma' and len(valid_dets) > 0:
                             furo_bhc_boxes = [v['d']['box'] for v in valid_dets if v['d']['cls_nome'] in ['Furo', 'BHC']]
@@ -579,13 +599,11 @@ def main():
                                         xr = min(bx_td[2], bx_furo[2])
                                         yb = min(bx_td[3], bx_furo[3])
                                         
-                                        # Verifica se houve colisão/sobreposição dos Bounding Boxes
                                         if xr > xl and yb > yt:
                                             inter_area = (xr - xl) * (yb - yt)
                                             area_furo = (bx_furo[2] - bx_furo[0]) * (bx_furo[3] - bx_furo[1])
                                             area_min = min(area_td, area_furo)
                                             
-                                            # Se o TD esbarrar em mais de 5% da caixa do Furo, ele é engolido e deletado.
                                             if (inter_area / area_min) > 0.05:
                                                 manter = False
                                                 break
