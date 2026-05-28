@@ -99,7 +99,6 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    # TAMANHO ORIGINAL DOS TRIÂNGULOS (Sem tratamento de imagem adicional)
     size_x = 10
     size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
@@ -410,7 +409,6 @@ def main():
                                         
                                     cls_nome = model.names[int(box.cls)]
                                     
-                                    # Renomear TDF para TD no Boleto e na Alma
                                     if local_nome in ['Boleto', 'Alma'] and cls_nome == 'TDF':
                                         cls_nome = 'TD'
                                         
@@ -460,7 +458,7 @@ def main():
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
                                 # ========================================================
-                                # REGRAS PARA TD (Boleto e Alma): Altura >= 8mm e Cor (Vermelho, Azul ou Verde)
+                                # REGRAS PARA TD (Boleto e Alma)
                                 # ========================================================
                                 if local_nome in ['Boleto', 'Alma'] and d['cls_nome'] == 'TD':
                                     if altura_mm < 8:
@@ -468,7 +466,6 @@ def main():
                                         
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
-                                    
                                     roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
                                     
                                     tem_vermelho = np.any(np.all(roi_bgr_mascarado == [0, 0, 255], axis=-1)) 
@@ -477,7 +474,24 @@ def main():
                                     
                                     if not (tem_vermelho or tem_azul or tem_verde):
                                         continue
-                                        
+                                    
+                                    # [MECANISMO NOVO DE DEFESA] 
+                                    # Se o TD estiver na Alma, com profundidade de Furo e tiver as cores do Furo (Verde e Roxo), ele é um Furo falso e será destruído aqui.
+                                    if local_nome == 'Alma':
+                                        center_y_mm_calc = min_depth + delta_depth * (py1 + py2) / 2.0
+                                        if 80 <= center_y_mm_calc <= 120:
+                                            lower_green = np.array([0, 100, 0], dtype=np.uint8)
+                                            upper_green = np.array([50, 255, 50], dtype=np.uint8)
+                                            mask_verde_td = cv2.inRange(roi_bgr_mascarado, lower_green, upper_green)
+
+                                            lower_purple = np.array([100, 0, 100], dtype=np.uint8)
+                                            upper_purple = np.array([180, 50, 180], dtype=np.uint8)
+                                            mask_roxa_td = cv2.inRange(roi_bgr_mascarado, lower_purple, upper_purple)
+                                            
+                                            kernel = np.ones((3, 3), np.uint8)
+                                            if np.any(cv2.erode(mask_verde_td, kernel, iterations=1)) and np.any(cv2.erode(mask_roxa_td, kernel, iterations=1)):
+                                                continue 
+                                                
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
                                 
                                 # Filtro 1: ALMA (Furos)
@@ -522,7 +536,7 @@ def main():
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
                                     
                                 # ========================================================
-                                # FILTRO PATIM: ACUMULADOR DE TDF >= 6mm COM INCLINAÇÃO
+                                # FILTRO PATIM
                                 # ========================================================
                                 elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
                                     if altura_mm >= 6:
@@ -543,15 +557,13 @@ def main():
                                             'start': start
                                         })
                                 
-                                # Outras detecções passam direto
                                 else:
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
 
                         # ========================================================
-                        # REGRA ALMA: Descartar TD se estiver dentro de Furo ou BHC
+                        # [MECANISMO NOVO DE DEFESA] SOBREPOSIÇÃO GEOMÉTRICA NA ALMA
                         # ========================================================
                         if local_nome == 'Alma' and len(valid_dets) > 0:
-                            # Primeiro, mapeamos todos os Bounding Boxes de Furos e BHCs validados
                             furo_bhc_boxes = [v['d']['box'] for v in valid_dets if v['d']['cls_nome'] in ['Furo', 'BHC']]
                             
                             filtered_dets = []
@@ -559,17 +571,25 @@ def main():
                                 manter = True
                                 if v['d']['cls_nome'] == 'TD':
                                     bx_td = v['d']['box']
-                                    # Ponto central exato da detecção do TD
-                                    cx_td = (bx_td[0] + bx_td[2]) / 2.0
-                                    cy_td = (bx_td[1] + bx_td[3]) / 2.0
+                                    area_td = (bx_td[2] - bx_td[0]) * (bx_td[3] - bx_td[1])
                                     
-                                    # Compara o centro do TD contra todas as caixas de Furo/BHC
                                     for bx_furo in furo_bhc_boxes:
-                                        # Se o X e o Y do centro do TD estiverem dentro do limite do Furo, descarta o TD
-                                        if bx_furo[0] <= cx_td <= bx_furo[2] and bx_furo[1] <= cy_td <= bx_furo[3]:
-                                            manter = False
-                                            break
+                                        xl = max(bx_td[0], bx_furo[0])
+                                        yt = max(bx_td[1], bx_furo[1])
+                                        xr = min(bx_td[2], bx_furo[2])
+                                        yb = min(bx_td[3], bx_furo[3])
+                                        
+                                        # Verifica se houve colisão/sobreposição dos Bounding Boxes
+                                        if xr > xl and yb > yt:
+                                            inter_area = (xr - xl) * (yb - yt)
+                                            area_furo = (bx_furo[2] - bx_furo[0]) * (bx_furo[3] - bx_furo[1])
+                                            area_min = min(area_td, area_furo)
                                             
+                                            # Se o TD esbarrar em mais de 5% da caixa do Furo, ele é engolido e deletado.
+                                            if (inter_area / area_min) > 0.05:
+                                                manter = False
+                                                break
+                                                
                                 if manter:
                                     filtered_dets.append(v)
                             valid_dets = filtered_dets
