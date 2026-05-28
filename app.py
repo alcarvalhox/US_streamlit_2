@@ -49,10 +49,11 @@ from scipy.spatial import cKDTree
 # =====================================================================
 # 1. CONFIGURAÇÕES GLOBAIS E FUNÇÕES BASE
 # =====================================================================
+# CONFIGURAÇÃO ALTERADA: Suporte a listas de modelos por região
 CONFIG_MODELOS = {
-    "Alma": "best_alma_3.pt",
-    "Boleto": "best_boleto_1.pt",
-    "Patim": "best_patim_1.pt"
+    "Alma": ["best_alma_3.pt"],
+    "Boleto": ["best_boleto_1.pt", "best_patim_1.pt"],
+    "Patim": ["best_patim_1.pt"]
 }
 
 LIMITES_PROFUNDIDADE = {
@@ -218,7 +219,6 @@ def classificar_furo_bhc(roi_bgr, roi_mask_bool):
                         return True
         return False
 
-    # REQUISITO 3: Somente quando existirem retas paralelas verde-verde E roxo-roxo
     if tem_sobreposicao_vertical_exata(contours_v) or tem_sobreposicao_vertical_exata(contours_p):
         return 'BHC'
     
@@ -340,9 +340,13 @@ def main():
         st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
         
         modelos_ativos = {}
-        for local_nome, pt_file in CONFIG_MODELOS.items():
-            m = load_yolo_model(pt_file) 
-            if m: modelos_ativos[local_nome] = m
+        for local_nome, pts in CONFIG_MODELOS.items():
+            lista_modelos = []
+            for pt_file in pts:
+                m = load_yolo_model(pt_file)
+                if m: lista_modelos.append(m)
+            if lista_modelos:
+                modelos_ativos[local_nome] = lista_modelos
                 
         if not modelos_ativos:
             st.error("Nenhum modelo (.pt) encontrado na pasta 'modelo'. Adicione pelo menos um para realizar a inferência.")
@@ -362,7 +366,7 @@ def main():
         total_steps = len(modelos_ativos) * len(range(int(df_raw['odo'].min()), int(df_raw['odo'].max()), 2400))
         passo_atual = 0
 
-        for local_nome, model in modelos_ativos.items():
+        for local_nome, model_list in modelos_ativos.items():
             min_depth, max_depth = LIMITES_PROFUNDIDADE.get(local_nome, (0, 223))
             delta_depth = max_depth - min_depth if (max_depth - min_depth) > 0 else 1
             
@@ -392,30 +396,38 @@ def main():
                         img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
                         img_clean = img_base.copy()
                         
-                        results = model.predict(img_clean, verbose=False, conf=0.05, iou=0.85)
-                        
                         valid_dets = []
-                        if len(results[0].boxes) > 0:
-                            raw_dets = []
-                            h_img, w_img = img_clean.shape[:2]
+                        raw_dets = []
+                        h_img, w_img = img_clean.shape[:2]
+                        
+                        for model in model_list:
+                            results = model.predict(img_clean, verbose=False, conf=0.05, iou=0.85)
                             
-                            masks_xy = results[0].masks.xy if hasattr(results[0], 'masks') and results[0].masks is not None else [None] * len(results[0].boxes)
-                            
-                            for i, box in enumerate(results[0].boxes):
-                                mask_u8 = np.zeros((h_img, w_img), dtype=np.uint8)
-                                poly = masks_xy[i]
+                            if len(results[0].boxes) > 0:
+                                masks_xy = results[0].masks.xy if hasattr(results[0], 'masks') and results[0].masks is not None else [None] * len(results[0].boxes)
                                 
-                                if poly is not None and len(poly) > 0:
-                                    cv2.fillPoly(mask_u8, [np.array(poly, dtype=np.int32)], 1)
+                                for i, box in enumerate(results[0].boxes):
+                                    mask_u8 = np.zeros((h_img, w_img), dtype=np.uint8)
+                                    poly = masks_xy[i]
                                     
-                                raw_dets.append({
-                                    'box': box.xyxy[0].cpu().numpy().astype(int),
-                                    'conf': float(box.conf),
-                                    'cls_nome': model.names[int(box.cls)],
-                                    'cls_id': int(box.cls),
-                                    'mask': mask_u8 > 0 
-                                })
-                            
+                                    if poly is not None and len(poly) > 0:
+                                        cv2.fillPoly(mask_u8, [np.array(poly, dtype=np.int32)], 1)
+                                        
+                                    cls_nome = model.names[int(box.cls)]
+                                    
+                                    # REQUISITO: Renomear TDF para TD quando a inferência for realizada no Boleto
+                                    if local_nome == 'Boleto' and cls_nome == 'TDF':
+                                        cls_nome = 'TD'
+                                        
+                                    raw_dets.append({
+                                        'box': box.xyxy[0].cpu().numpy().astype(int),
+                                        'conf': float(box.conf),
+                                        'cls_nome': cls_nome,
+                                        'cls_id': int(box.cls),
+                                        'mask': mask_u8 > 0 
+                                    })
+                                    
+                        if len(raw_dets) > 0:
                             raw_dets.sort(key=lambda x: x['conf'], reverse=True)
                             
                             dets_mescladas = []
@@ -430,11 +442,11 @@ def main():
                                         area_inter = (xr-xl)*(yb-yt)
                                         area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
                                         
-                                        # REQUISITO 2: NMS mais agressivo para a classe Furo (0.20) para mesclar sub-caixas
                                         limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else (0.20 if d['cls_nome'] == 'Furo' else 0.40)
                                         
                                         if (area_inter / area_min) > limite_nms:
-                                            if d['cls_id'] == f['cls_id']:
+                                            # Modificado de cls_id para cls_nome para evitar colisão entre modelos
+                                            if d['cls_nome'] == f['cls_nome']:
                                                 f['box'][0] = min(bx1[0], bx2[0])
                                                 f['box'][1] = min(bx1[1], bx2[1])
                                                 f['box'][2] = max(bx1[2], bx2[2])
@@ -453,14 +465,9 @@ def main():
                                 altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
-                               
-                                # Filtro 1: ALMA (Furos)
-                                # Filtro 1: ALMA (Furos)
-                                # Filtro 1: ALMA (Furos)
                                 # Filtro 1: ALMA (Furos)
                                 if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     
-                                    # REQUISITO 4: Range estrito em Alma de 80 a 120 de Profundidade
                                     center_y_mm_calc = min_depth + delta_depth * (py1 + py2) / 2.0
                                     if not (80 <= center_y_mm_calc <= 120):
                                         continue
@@ -471,10 +478,8 @@ def main():
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # Mantém o mascaramento da Bounding Box (olha apenas para o desenho da IA)
                                     roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
                                     
-                                    # Isola as cores exatas
                                     lower_green = np.array([0, 100, 0], dtype=np.uint8)
                                     upper_green = np.array([50, 255, 50], dtype=np.uint8)
                                     mask_verde = cv2.inRange(roi_bgr_mascarado, lower_green, upper_green)
@@ -483,13 +488,10 @@ def main():
                                     upper_purple = np.array([180, 50, 180], dtype=np.uint8)
                                     mask_roxa = cv2.inRange(roi_bgr_mascarado, lower_purple, upper_purple)
                                     
-                                    # NOVA SOLUÇÃO ANTI-RUÍDO: Erosão Morfológica
-                                    # "Lixa" as máscaras. Pixels soltos (ruído) somem. Blocos sólidos (furos) sobrevivem.
                                     kernel = np.ones((3, 3), np.uint8)
                                     mask_verde_limpa = cv2.erode(mask_verde, kernel, iterations=1)
                                     mask_roxa_limpa = cv2.erode(mask_roxa, kernel, iterations=1)
                                     
-                                    # Verifica se, após a erosão, ainda sobrou massa real de ambas as cores
                                     tem_verde = np.any(mask_verde_limpa)
                                     tem_roxo = np.any(mask_roxa_limpa)
                                     
@@ -503,6 +505,7 @@ def main():
                                         d['cls_id'] = 99 
                                         
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
+                                    
                                 # ========================================================
                                 # FILTRO PATIM: ACUMULADOR DE TDF >= 6mm COM INCLINAÇÃO
                                 # ========================================================
