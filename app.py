@@ -49,8 +49,9 @@ from scipy.spatial import cKDTree
 # =====================================================================
 # 1. CONFIGURAÇÕES GLOBAIS E FUNÇÕES BASE
 # =====================================================================
+# ATUALIZAÇÃO: best_patim_1.pt inserido também na Alma
 CONFIG_MODELOS = {
-    "Alma": ["best_alma_3.pt"],
+    "Alma": ["best_alma_3.pt", "best_patim_1.pt"],
     "Boleto": ["best_boleto_1.pt", "best_patim_1.pt"],
     "Patim": ["best_patim_1.pt"]
 }
@@ -99,15 +100,20 @@ def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
     x_coords = ((odos - start) / 2400.0 * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
     
-    size_x = 10
-    size_y = 5
+    # Tratamento para fundir os pontos e melhorar os agrupamentos coloridos
+    size_x = 30  
+    size_y = 15  
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
     
     for x, y, p in zip(x_coords, y_coords, probes):
         if 0 <= x < width and 0 <= y < height:
             cv2.fillPoly(img, [base_triangle + [x, y]], probe_to_bgr.get(p, (0, 255, 255)))
             
-    return img
+    kernel_dilatacao = np.ones((7, 7), np.uint8) 
+    img_tratada = cv2.dilate(img, kernel_dilatacao, iterations=2)
+    img_tratada = cv2.GaussianBlur(img_tratada, (5, 5), 0)
+    
+    return img_tratada
 
 def gerar_zip_dataset():
     zip_buffer = io.BytesIO()
@@ -409,8 +415,8 @@ def main():
                                         
                                     cls_nome = model.names[int(box.cls)]
                                     
-                                    # Renomear TDF para TD no Boleto
-                                    if local_nome == 'Boleto' and cls_nome == 'TDF':
+                                    # Renomear TDF para TD no Boleto e na Alma
+                                    if local_nome in ['Boleto', 'Alma'] and cls_nome == 'TDF':
                                         cls_nome = 'TD'
                                         
                                     raw_dets.append({
@@ -459,29 +465,28 @@ def main():
                                 altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
                                 
                                 # ========================================================
-                                # REGRAS PARA TD NO BOLETO: Altura >= 8mm e Cor (Vermelho, Azul ou Verde)
+                                # REGRAS PARA TD (Boleto e Alma): Altura >= 8mm e Cor (Vermelho, Azul ou Verde)
                                 # ========================================================
-                                if local_nome == 'Boleto' and d['cls_nome'] == 'TD':
+                                if local_nome in ['Boleto', 'Alma'] and d['cls_nome'] == 'TD':
                                     if altura_mm < 8:
                                         continue
                                         
                                     roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
                                     roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
                                     
-                                    # Aplica a máscara para garantir que estamos olhando apenas para os pixels do TD
                                     roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
                                     
-                                    # Verifica se existe pelo menos um pixel de alguma das cores alvo na máscara
-                                    tem_vermelho = np.any(np.all(roi_bgr_mascarado == [0, 0, 255], axis=-1))  # BGR: Red
-                                    tem_azul = np.any(np.all(roi_bgr_mascarado == [255, 0, 0], axis=-1))      # BGR: Blue
-                                    tem_verde = np.any(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))     # BGR: Green (Probe 6/7)
+                                    tem_vermelho = np.any(np.all(roi_bgr_mascarado == [0, 0, 255], axis=-1)) 
+                                    tem_azul = np.any(np.all(roi_bgr_mascarado == [255, 0, 0], axis=-1))      
+                                    tem_verde = np.any(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))     
                                     
-                                    # Se a detecção não tiver nenhuma dessas cores, é descartada
                                     if not (tem_vermelho or tem_azul or tem_verde):
                                         continue
+                                        
+                                    valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
                                 
                                 # Filtro 1: ALMA (Furos)
-                                if local_nome == 'Alma' and d['cls_nome'] == 'Furo':
+                                elif local_nome == 'Alma' and d['cls_nome'] == 'Furo':
                                     
                                     center_y_mm_calc = min_depth + delta_depth * (py1 + py2) / 2.0
                                     if not (80 <= center_y_mm_calc <= 120):
@@ -547,6 +552,31 @@ def main():
                                 else:
                                     valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
 
+                        # ========================================================
+                        # NOVA REGRA ALMA: Descartar TD se estiver dentro de Furo ou BHC
+                        # ========================================================
+                        if local_nome == 'Alma' and len(valid_dets) > 0:
+                            furo_bhc_boxes = [v['d']['box'] for v in valid_dets if v['d']['cls_nome'] in ['Furo', 'BHC']]
+                            
+                            filtered_dets = []
+                            for v in valid_dets:
+                                manter = True
+                                if v['d']['cls_nome'] == 'TD':
+                                    bx_td = v['d']['box']
+                                    # Ponto central exato do defeito TD
+                                    cx_td = (bx_td[0] + bx_td[2]) / 2.0
+                                    cy_td = (bx_td[1] + bx_td[3]) / 2.0
+                                    
+                                    for bx_furo in furo_bhc_boxes:
+                                        # Verifica se o centro do TD cai dentro dos limites do Furo/BHC
+                                        if bx_furo[0] <= cx_td <= bx_furo[2] and bx_furo[1] <= cy_td <= bx_furo[3]:
+                                            manter = False
+                                            break
+                                            
+                                if manter:
+                                    filtered_dets.append(v)
+                            valid_dets = filtered_dets
+
                         # Salva o frame da janela na lista do lado
                         side_windows.append({
                             'start': start,
@@ -578,10 +608,8 @@ def main():
                                 inc1 = side_patim_tdfs[i]['inclinacao']
                                 inc2 = side_patim_tdfs[j]['inclinacao']
                                 
-                                # Condições da Dupla
                                 cores_validas = ((v1 and r2) or (r1 and v2))
                                 altura_valida = (h1 >= 10 or h2 >= 10)
-                                # Primeiro para a direita (/), segundo para a esquerda (\)
                                 inclinacao_valida = (inc1 == "Direita" and inc2 == "Esquerda")
                                 
                                 par_valido = cores_validas and altura_valida and inclinacao_valida
@@ -663,11 +691,9 @@ def main():
                             x2 = int((x2_orig / w_img) * VIS_W)
                             y2 = int((y2_orig / h_img) * VIS_H)
                             
-                            # Caixa diferenciada (Cor Ciano) para os TDFs Conjugados
                             cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 255, 255) if d['cls_nome'] == 'TDF_Conjugado' else (0, 0, 255)
                             cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
                             
-                            # Formatação da etiqueta com a distância inserida caso exista
                             lbl_text = f"#{local_id} {d['cls_nome']}"
                             if 'dist_par' in d:
                                 lbl_text += f" ({d['dist_par']}mm)"
