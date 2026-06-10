@@ -1,18 +1,20 @@
-import subprocess
-import sys
+
 import os
-import tempfile
-import base64
-import warnings
+import sys
+import io
 import math
-from collections import Counter
+import zipfile
+import tempfile
+import subprocess
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
 # =====================================================================
 # BLOQUEIO DE LOGS, TELEMETRIA E "PHONE HOME" DO YOLO
 # =====================================================================
 TMP_DIR = tempfile.gettempdir()
 YOLO_CFG_DIR = os.path.join(TMP_DIR, 'Ultralytics_Config')
-os.makedirs(YOLO_CFG_DIR, exist_ok=True) 
+os.makedirs(YOLO_CFG_DIR, exist_ok=True)
 
 os.environ['YOLO_CONFIG_DIR'] = YOLO_CFG_DIR
 os.environ['YOLO_VERBOSE'] = 'False'
@@ -21,33 +23,38 @@ os.environ['YOLO_UPDATE_CHECK'] = 'False'
 os.environ['YOLO_SYNC'] = 'False'
 
 # =====================================================================
-# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS
+# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS (opcional)
 # =====================================================================
 def install_dependencies():
     if os.path.exists("requirements.txt"):
         try:
-            if 'dependencies_installed' not in os.environ:
+            if 'dependencies_installed_hybrid_modelo' not in os.environ:
                 subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "scipy"])
-                os.environ['dependencies_installed'] = '1'
+                os.environ['dependencies_installed_hybrid_modelo'] = '1'
         except Exception as e:
             print(f"Erro ao instalar dependências: {e}")
 
 if __name__ == "__main__":
     install_dependencies()
 
-import streamlit as st
-import pandas as pd
-import numpy as np
 import cv2
-import io
-import zipfile
+import joblib
+import numpy as np
+import pandas as pd
+import streamlit as st
 from ultralytics import YOLO
-from datetime import datetime
 from scipy.spatial import cKDTree
 
+# Permite importar o vetor tabular já criado anteriormente, assumindo que o arquivo
+# pipeline_tabular_us_2026_revisado.py está no mesmo diretório deste app.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+from pipeline_tabular_us_2026_revisado import TableVectorizer
+
 # =====================================================================
-# 1. CONFIGURAÇÕES GLOBAIS E FUNÇÕES BASE
+# 1. CONFIGURAÇÕES GLOBAIS
 # =====================================================================
 CONFIG_MODELOS = {
     "Alma": ["best_alma_3.pt", "best_patim_1.pt"],
@@ -56,931 +63,629 @@ CONFIG_MODELOS = {
 }
 
 LIMITES_PROFUNDIDADE = {
-    "Boleto": (0, 52),
-    "Alma": (53, 179),
-    "Patim": (180, 223)
+    "Boleto": (0.0, 52.0),
+    "Alma": (53.0, 179.0),
+    "Patim": (180.0, 223.0)
 }
 
 SONDAS_ESQUERDA = [0, 6, 8, 4, 10]
 SONDAS_DIREITA = [1, 7, 9, 5, 11]
-MODEL_DIR = "modelo"
 
-def load_image_b64(path):
+# ---------------------------------------------------------------------
+# AJUSTE PEDIDO PELO USUÁRIO:
+# TODOS os artefatos ficam na pasta `modelo` do GitHub.
+# ---------------------------------------------------------------------
+MODEL_DIR = "modelo"
+ARTIFACTS_DIR = MODEL_DIR
+
+# Tamanho da janela física por imagem B-scan
+WINDOW_MM = 2400  # 2,4 m em mm
+STEP_MM = 2400
+
+# Tamanho da imagem sintética para o YOLO
+BSCAN_WIDTH = 1500
+BSCAN_HEIGHT = 500
+
+# Cores visuais por probe
+PROBE_TO_BGR = {
+    0: (0, 255, 255), 1: (0, 255, 255),
+    6: (0, 128, 0),   7: (0, 128, 0),
+    8: (128, 0, 128), 9: (128, 0, 128),
+    4: (0, 0, 255),   5: (0, 0, 255),
+    10: (255, 0, 0),  11: (255, 0, 0)
+}
+
+# =====================================================================
+# 2. FUNÇÕES AUXILIARES
+# =====================================================================
+def load_image_b64(path: str) -> Optional[str]:
+    if not os.path.exists(path):
+        return None
     with open(path, "rb") as f:
+        import base64
         return base64.b64encode(f.read()).decode()
 
-def remover_pontos_isolados(df, raio=15):
-    if df.empty: return df
+
+def remove_pontos_isolados(df: pd.DataFrame, raio: float = 15) -> pd.DataFrame:
+    if df.empty or not {'odo', 'depth'}.issubset(df.columns):
+        return df
     coords = df[['odo', 'depth']].values
     tree = cKDTree(coords)
     contagem = tree.query_ball_point(coords, r=raio, return_length=True)
-    return df[contagem > 1].copy() 
+    return df[contagem > 1].copy()
+
+
+def normalize_odo_to_mm(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if 'odo' in out.columns:
+        odo_series = pd.to_numeric(out['odo'], errors='coerce')
+        if odo_series.dropna().median() < 10000:
+            out['odo'] = (odo_series * 1_000_000).round().astype(int)
+        else:
+            out['odo'] = odo_series.round().astype(int)
+    elif 'odo_km' in out.columns:
+        out['odo'] = (pd.to_numeric(out['odo_km'], errors='coerce') * 1_000_000).round().astype(int)
+    elif 'x_m' in out.columns:
+        out['odo'] = (pd.to_numeric(out['x_m'], errors='coerce') * 1000).round().astype(int)
+    return out
+
+
+def preprocessar_raw(files: List[io.BytesIO]) -> pd.DataFrame:
+    lista = []
+    for f in files:
+        f.seek(0)
+        df = pd.read_csv(f)
+        df['source_upload'] = f.name
+        lista.append(df)
+    df_raw = pd.concat(lista, ignore_index=True)
+    df_raw = normalize_odo_to_mm(df_raw)
+
+    if 'depth_mm' not in df_raw.columns and 'depth' in df_raw.columns:
+        df_raw['depth_mm'] = pd.to_numeric(df_raw['depth'], errors='coerce')
+    if 'depth' not in df_raw.columns and 'depth_mm' in df_raw.columns:
+        df_raw['depth'] = pd.to_numeric(df_raw['depth_mm'], errors='coerce')
+
+    if 'side' not in df_raw.columns and 'probe' in df_raw.columns:
+        probe = pd.to_numeric(df_raw['probe'], errors='coerce')
+        df_raw['side'] = np.where(probe.isin(SONDAS_ESQUERDA), 'LEFT', np.where(probe.isin(SONDAS_DIREITA), 'RIGHT', 'UNKNOWN'))
+
+    if 'level' in df_raw.columns:
+        df_raw = df_raw[pd.to_numeric(df_raw['level'], errors='coerce') > 450].copy()
+
+    df_raw = remove_pontos_isolados(df_raw)
+    df_raw = df_raw.sort_values(by='odo').reset_index(drop=True)
+    return df_raw
+
+
+def separar_lados(df_local: pd.DataFrame) -> List[Tuple[str, pd.DataFrame]]:
+    if 'probe' in df_local.columns:
+        df_esq = df_local[pd.to_numeric(df_local['probe'], errors='coerce').isin(SONDAS_ESQUERDA)].copy()
+        df_dir = df_local[pd.to_numeric(df_local['probe'], errors='coerce').isin(SONDAS_DIREITA)].copy()
+    else:
+        side_upper = df_local['side'].astype(str).str.upper() if 'side' in df_local.columns else pd.Series(index=df_local.index, dtype=str)
+        df_esq = df_local[side_upper.eq('LEFT')].copy()
+        df_dir = df_local[side_upper.eq('RIGHT')].copy()
+    return [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
+
 
 @st.cache_resource
-def load_yolo_model(nome_pt):
-    if not os.path.exists(MODEL_DIR): os.makedirs(MODEL_DIR)
+def load_yolo_model(nome_pt: str):
+    os.makedirs(MODEL_DIR, exist_ok=True)
     path_pt = os.path.join(MODEL_DIR, nome_pt)
     if os.path.exists(path_pt):
         return YOLO(path_pt, task='segment', verbose=False)
-    return None 
+    return None
 
-def generate_bscan_buffer(df_win, start, end, min_depth, max_depth):
-    width, height = 1500, 500
+
+@st.cache_resource
+def load_tabular_artifacts(artifacts_dir: str = ARTIFACTS_DIR):
+    """
+    Carrega artefatos do modelo tabular a partir da pasta `modelo/`.
+    Esperado em `modelo/`:
+      - best_model.joblib
+      - vectorizer.json
+      - label_encoder.joblib
+    """
+    vectorizer_path = os.path.join(artifacts_dir, 'vectorizer.json')
+    model_path = os.path.join(artifacts_dir, 'best_model.joblib')
+    label_encoder_path = os.path.join(artifacts_dir, 'label_encoder.joblib')
+
+    if not os.path.exists(vectorizer_path):
+        raise FileNotFoundError(f"Arquivo não encontrado: {vectorizer_path}")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Arquivo não encontrado: {model_path}")
+    if not os.path.exists(label_encoder_path):
+        raise FileNotFoundError(f"Arquivo não encontrado: {label_encoder_path}")
+
+    vectorizer = TableVectorizer.load(vectorizer_path)
+    model = joblib.load(model_path)
+    label_encoder = joblib.load(label_encoder_path)
+    try:
+        model.n_jobs = 1
+    except Exception:
+        pass
+    return vectorizer, model, label_encoder
+
+
+def generate_bscan_buffer(df_win: pd.DataFrame, start: int, end: int, min_depth: float, max_depth: float) -> np.ndarray:
+    width, height = BSCAN_WIDTH, BSCAN_HEIGHT
     img = np.full((height, width, 3), 255, dtype=np.uint8)
-    probe_to_bgr = { 0: (0, 255, 255), 1: (0, 255, 255), 6: (0, 128, 0), 7: (0, 128, 0), 8: (128, 0, 128), 9: (128, 0, 128), 4: (0, 0, 255), 5: (0, 0, 255), 10: (255, 0, 0), 11: (255, 0, 0) }
-    
-    odos = df_win['odo'].values
-    depths = df_win['depth'].values
-    probes = df_win['probe'].values
-    
-    delta_depth = max_depth - min_depth
-    if delta_depth <= 0: delta_depth = 1 
-    
-    x_coords = ((odos - start) / 2400.0 * width).astype(int)
+    if df_win.empty:
+        return img
+
+    odos = pd.to_numeric(df_win['odo'], errors='coerce').values
+    depths = pd.to_numeric(df_win['depth'], errors='coerce').values
+    probes = pd.to_numeric(df_win['probe'], errors='coerce').fillna(-1).astype(int).values if 'probe' in df_win.columns else np.full(len(df_win), -1, dtype=int)
+
+    delta_depth = max_depth - min_depth if (max_depth - min_depth) > 0 else 1.0
+    x_coords = ((odos - start) / float(WINDOW_MM) * width).astype(int)
     y_coords = ((depths - min_depth) / float(delta_depth) * height).astype(int)
-    
+
     size_x = 10
     size_y = 5
     base_triangle = np.array([[0, -size_y], [-size_x, size_y], [size_x, size_y]], dtype=np.int32)
-    
+
     for x, y, p in zip(x_coords, y_coords, probes):
         if 0 <= x < width and 0 <= y < height:
-            cv2.fillPoly(img, [base_triangle + [x, y]], probe_to_bgr.get(p, (0, 255, 255)))
-            
+            cv2.fillPoly(img, [base_triangle + [x, y]], PROBE_TO_BGR.get(int(p), (0, 255, 255)))
     return img
 
-def gerar_zip_dataset():
+
+def map_bbox_to_physical(box_xyxy: np.ndarray, start_odo_mm: int, min_depth: float, max_depth: float) -> Dict[str, float]:
+    x1, y1, x2, y2 = box_xyxy.astype(float)
+    width = BSCAN_WIDTH
+    height = BSCAN_HEIGHT
+
+    odo1 = start_odo_mm + (x1 / width) * WINDOW_MM
+    odo2 = start_odo_mm + (x2 / width) * WINDOW_MM
+    delta_depth = max_depth - min_depth if (max_depth - min_depth) > 0 else 1.0
+    depth1 = min_depth + (y1 / height) * delta_depth
+    depth2 = min_depth + (y2 / height) * delta_depth
+
+    return {
+        'odo_min_mm': float(min(odo1, odo2)),
+        'odo_max_mm': float(max(odo1, odo2)),
+        'depth_min_mm': float(min(depth1, depth2)),
+        'depth_max_mm': float(max(depth1, depth2)),
+    }
+
+
+def region_df_from_bbox(df_win: pd.DataFrame, bbox_phys: Dict[str, float]) -> pd.DataFrame:
+    if df_win.empty:
+        return df_win.copy()
+    odo = pd.to_numeric(df_win['odo'], errors='coerce')
+    depth = pd.to_numeric(df_win['depth'], errors='coerce')
+    region = df_win[(odo >= bbox_phys['odo_min_mm']) & (odo <= bbox_phys['odo_max_mm']) &
+                    (depth >= bbox_phys['depth_min_mm']) & (depth <= bbox_phys['depth_max_mm'])].copy()
+    return region
+
+
+def tabular_validate_region(region_df: pd.DataFrame, vectorizer: TableVectorizer, model, label_encoder) -> Dict[str, object]:
+    if region_df.empty:
+        return {'tabular_class': None, 'tabular_conf': None, 'status': 'regiao_vazia'}
+
+    df_tab = region_df.copy()
+    if 'depth_mm' not in df_tab.columns and 'depth' in df_tab.columns:
+        df_tab['depth_mm'] = pd.to_numeric(df_tab['depth'], errors='coerce')
+    if 'side' not in df_tab.columns and 'probe' in df_tab.columns:
+        probe = pd.to_numeric(df_tab['probe'], errors='coerce')
+        df_tab['side'] = np.where(probe.isin(SONDAS_ESQUERDA), 'LEFT', np.where(probe.isin(SONDAS_DIREITA), 'RIGHT', 'UNKNOWN'))
+    if 'angle' not in df_tab.columns:
+        df_tab['angle'] = np.nan
+
+    feats = vectorizer.transform_one_df(df_tab).reshape(1, -1)
+    pred_num = model.predict(feats)[0]
+    pred_label = label_encoder.inverse_transform([pred_num])[0]
+    conf = None
+    if hasattr(model, 'predict_proba'):
+        proba = model.predict_proba(feats)[0]
+        conf = float(np.max(proba))
+    return {'tabular_class': str(pred_label), 'tabular_conf': conf, 'status': 'ok'}
+
+
+def annotate_detection_on_image(img_draw: np.ndarray, det: Dict[str, object], largura_vis: int, altura_vis: int):
+    box = det['box'].astype(int)
+    x1, y1, x2, y2 = box.tolist()
+    sx = largura_vis / float(BSCAN_WIDTH)
+    sy = altura_vis / float(BSCAN_HEIGHT)
+    vx1, vy1, vx2, vy2 = int(x1 * sx), int(y1 * sy), int(x2 * sx), int(y2 * sy)
+
+    tab_class = det.get('tabular_class') or 'Sem_Validação'
+    tab_conf = det.get('tabular_conf')
+    yolo_class = det.get('yolo_class', 'N/A')
+
+    cor_bbox = (0, 0, 255) if tab_class == 'Trinca' else (255, 0, 255) if tab_class == 'BHC' else (0, 255, 255)
+    cv2.rectangle(img_draw, (vx1, vy1), (vx2, vy2), cor_bbox, 2)
+
+    if tab_conf is not None:
+        lbl = f"TAB: {tab_class} ({tab_conf:.2f}) | YOLO: {yolo_class}"
+    else:
+        lbl = f"TAB: {tab_class} | YOLO: {yolo_class}"
+
+    cv2.putText(img_draw, lbl, (vx1 + 4, max(18, vy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2)
+    cv2.putText(img_draw, lbl, (vx1 + 4, max(18, vy1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, cor_bbox, 1)
+
+
+def detectar_e_validar(df_raw: pd.DataFrame, modelos_ativos: Dict[str, List[YOLO]], vectorizer: TableVectorizer, model_tab, label_encoder):
+    progress_bar = st.progress(0.0, text="Gerando imagens B-scan, executando YOLO e validando BBs com o modelo tabular...")
+    found = []
+    gallery = []
+
+    total_steps = 0
+    for local_nome in modelos_ativos.keys():
+        min_depth, max_depth = LIMITES_PROFUNDIDADE[local_nome]
+        df_local = df_raw[(pd.to_numeric(df_raw['depth'], errors='coerce') >= min_depth) & (pd.to_numeric(df_raw['depth'], errors='coerce') < max_depth)]
+        for _, df_side in separar_lados(df_local):
+            if not df_side.empty:
+                total_steps += max(1, math.ceil((int(df_side['odo'].max()) - int(df_side['odo'].min()) + 1) / STEP_MM))
+
+    passo_atual = 0
+
+    for local_nome, model_list in modelos_ativos.items():
+        min_depth, max_depth = LIMITES_PROFUNDIDADE.get(local_nome, (0.0, 223.0))
+        df_local = df_raw[(pd.to_numeric(df_raw['depth'], errors='coerce') >= min_depth) & (pd.to_numeric(df_raw['depth'], errors='coerce') < max_depth)].copy()
+        if df_local.empty:
+            continue
+
+        for lado_nome, df_side in separar_lados(df_local):
+            if df_side.empty:
+                continue
+
+            odo_min = int(df_side['odo'].min())
+            odo_max = int(df_side['odo'].max())
+
+            for start in range(odo_min, odo_max + 1, STEP_MM):
+                passo_atual += 1
+                if total_steps > 0:
+                    progress_bar.progress(min(0.02 + 0.98 * passo_atual / total_steps, 1.0),
+                                          text=f"Analisando {local_nome} ({lado_nome}) em ODO {start} mm...")
+
+                end = start + WINDOW_MM
+                df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] < end)].copy()
+                if len(df_win) < 5:
+                    continue
+
+                img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
+                img_clean = img_base.copy()
+                img_draw = cv2.resize(img_clean, (2400, 400), interpolation=cv2.INTER_LINEAR)
+
+                raw_dets = []
+                for model in model_list:
+                    results = model.predict(img_clean, verbose=False, conf=0.05, iou=0.85)
+                    if len(results[0].boxes) == 0:
+                        continue
+                    for box in results[0].boxes:
+                        cls_id = int(box.cls)
+                        cls_nome = model.names[cls_id]
+                        raw_dets.append({
+                            'box': box.xyxy[0].cpu().numpy().astype(int),
+                            'conf': float(box.conf),
+                            'yolo_class': cls_nome,
+                            'yolo_cls_id': cls_id,
+                        })
+
+                if not raw_dets:
+                    continue
+
+                raw_dets.sort(key=lambda x: x['conf'], reverse=True)
+                final_dets = []
+                for d in raw_dets:
+                    suprimido = False
+                    bx1 = d['box']
+                    for f in final_dets:
+                        bx2 = f['box']
+                        xl, yt = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
+                        xr, yb = min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
+                        if xr > xl and yb > yt:
+                            inter = (xr - xl) * (yb - yt)
+                            area1 = max(1, (bx1[2] - bx1[0]) * (bx1[3] - bx1[1]))
+                            area2 = max(1, (bx2[2] - bx2[0]) * (bx2[3] - bx2[1]))
+                            area_min = min(area1, area2)
+                            if (inter / area_min) > 0.4:
+                                suprimido = True
+                                break
+                    if not suprimido:
+                        final_dets.append(d)
+
+                houve_evento = False
+                for local_id, det in enumerate(final_dets, 1):
+                    bbox_phys = map_bbox_to_physical(det['box'], start_odo_mm=start, min_depth=min_depth, max_depth=max_depth)
+                    region_df = region_df_from_bbox(df_win, bbox_phys)
+                    tab = tabular_validate_region(region_df, vectorizer, model_tab, label_encoder)
+
+                    det['tabular_class'] = tab['tabular_class']
+                    det['tabular_conf'] = tab['tabular_conf']
+                    det['status_tabular'] = tab['status']
+                    det['bbox_phys'] = bbox_phys
+
+                    if det['tabular_class'] is None:
+                        continue
+
+                    houve_evento = True
+                    annotate_detection_on_image(img_draw, det, largura_vis=2400, altura_vis=400)
+
+                    center_odo_mm = (bbox_phys['odo_min_mm'] + bbox_phys['odo_max_mm']) / 2.0
+                    center_depth_mm = (bbox_phys['depth_min_mm'] + bbox_phys['depth_max_mm']) / 2.0
+                    largura_mm = int(abs(bbox_phys['odo_max_mm'] - bbox_phys['odo_min_mm']))
+                    altura_mm = int(abs(bbox_phys['depth_max_mm'] - bbox_phys['depth_min_mm']))
+
+                    found.append({
+                        'ID_Global': len(found),
+                        'ID_Img': f"#{local_id}",
+                        'Local': local_nome,
+                        'Lado': lado_nome,
+                        'Classe_YOLO': det['yolo_class'],
+                        'Classe_Tabular': det['tabular_class'],
+                        'ODO': int(center_odo_mm),
+                        'ODO_Ref': start,
+                        'Coordenada Depth(mm)': int(center_depth_mm),
+                        'Largura(mm)': largura_mm,
+                        'Altura(mm)': altura_mm,
+                        'Confiança_YOLO': f"{det['conf']:.2%}",
+                        'Confiança_Tabular': f"{det['tabular_conf']:.2%}" if det['tabular_conf'] is not None else None,
+                        'Aprovado': True,
+                        'BBox_ODO_Min_mm': int(bbox_phys['odo_min_mm']),
+                        'BBox_ODO_Max_mm': int(bbox_phys['odo_max_mm']),
+                        'BBox_Depth_Min_mm': float(bbox_phys['depth_min_mm']),
+                        'BBox_Depth_Max_mm': float(bbox_phys['depth_max_mm']),
+                        'Rows_Região_Tabular': int(len(region_df))
+                    })
+
+                if houve_evento:
+                    gallery.append({
+                        'img': img_draw,
+                        'img_clean': img_clean,
+                        'label': f"{lado_nome} @ {start}",
+                        'odo_ref': start,
+                        'lado': lado_nome,
+                        'local': local_nome,
+                    })
+
+    progress_bar.progress(1.0, text="✅ Processamento concluído!")
+    return found, gallery
+
+
+def generate_excel_report(df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Validacao_Hibrida')
+    return output.getvalue()
+
+
+def generate_zip_of_annotated_images(img_gallery: List[Dict[str, object]]) -> bytes:
     zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        for item in st.session_state.img_gallery:
-            if 'img_clean' not in item: continue
-            local = item.get('local', 'Alma') 
-            nome_base = f"{item['lado']}_{item['odo_ref']}"
-            
-            _, buffer_img = cv2.imencode(".jpg", item['img_clean'])
-            zip_file.writestr(f"{local}/images/{nome_base}.jpg", buffer_img.tobytes())
-            
-            linhas_yolo = []
-            for det in st.session_state.deteccoes:
-                if det['ODO_Ref'] == item['odo_ref'] and det['Lado'] == item['lado'] and det.get('Local', 'Alma') == local and det['Aprovado']:
-                    linhas_yolo.append(det['yolo_bbox'])
-            zip_file.writestr(f"{local}/labels/{nome_base}.txt", "\n".join(linhas_yolo))
-            
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for item in img_gallery:
+            nome = f"{item['local']}/{item['lado']}_{item['odo_ref']}.jpg"
+            ok, buffer_img = cv2.imencode('.jpg', item['img'])
+            if ok:
+                zip_file.writestr(nome, buffer_img.tobytes())
     return zip_buffer.getvalue()
 
 # =====================================================================
-# FUNÇÕES GEOMÉTRICAS E CLASSIFICAÇÕES
-# =====================================================================
-def calcular_inclinacao(mask_bool, x1, y1, x2, y2):
-    roi_mask = mask_bool[y1:y2, x1:x2]
-    pts_y, pts_x = np.where(roi_mask > 0)
-    
-    if len(pts_x) < 5:
-        return "Indefinida"
-    
-    points = np.column_stack((pts_x, pts_y)).astype(np.float32)
-    line = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01)
-    
-    if line is None:
-        return "Indefinida"
-    
-    vx, vy = float(line[0][0]), float(line[1][0])
-    
-    produto = vx * vy
-    if produto < -0.05:
-        return "Direita"
-    elif produto > 0.05:
-        return "Esquerda"
-    else:
-        return "Vertical"
-
-def classificar_furo_bhc(roi_bgr, roi_mask_bool):
-    lower_green = np.array([0, 100, 0], dtype=np.uint8)
-    upper_green = np.array([50, 255, 50], dtype=np.uint8)
-    mask_verde = cv2.inRange(roi_bgr, lower_green, upper_green)
-
-    lower_purple = np.array([100, 0, 100], dtype=np.uint8)
-    upper_purple = np.array([180, 50, 180], dtype=np.uint8)
-    mask_roxa = cv2.inRange(roi_bgr, lower_purple, upper_purple)
-
-    mask_yolo_u8 = (roi_mask_bool.astype(np.uint8) * 255)
-    mask_verde = cv2.bitwise_and(mask_verde, mask_yolo_u8)
-    mask_roxa = cv2.bitwise_and(mask_roxa, mask_yolo_u8)
-
-    kernel = np.ones((9, 9), np.uint8)
-    mask_v_closed = cv2.morphologyEx(mask_verde, cv2.MORPH_CLOSE, kernel)
-    mask_p_closed = cv2.morphologyEx(mask_roxa, cv2.MORPH_CLOSE, kernel)
-
-    contours_v, _ = cv2.findContours(mask_v_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    contours_p, _ = cv2.findContours(mask_p_closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    def tem_sobreposicao_vertical_exata(contours):
-        valid_c = [c for c in contours if cv2.contourArea(c) > 40]
-        if len(valid_c) < 2: return False
-
-        pts_list = []
-        for c in valid_c:
-            pts = c.reshape(-1, 2)
-            min_x = int(np.min(pts[:, 0]))
-            max_x = int(np.max(pts[:, 0]))
-            pts_list.append({'pts': pts, 'min_x': min_x, 'max_x': max_x})
-
-        for i in range(len(pts_list)):
-            for j in range(i+1, len(pts_list)):
-                c1 = pts_list[i]
-                c2 = pts_list[j]
-
-                overlap_min = max(c1['min_x'], c2['min_x'])
-                overlap_max = min(c1['max_x'], c2['max_x'])
-                overlap_width = overlap_max - overlap_min
-
-                if overlap_width >= 10:
-                    y_dists = []
-                    check_xs = [overlap_min + 2, overlap_min + overlap_width//2, overlap_max - 2]
-                    
-                    for cx in check_xs:
-                        mask1 = np.abs(c1['pts'][:, 0] - cx) <= 3
-                        mask2 = np.abs(c2['pts'][:, 0] - cx) <= 3
-                        
-                        p1_y = c1['pts'][mask1][:, 1]
-                        p2_y = c2['pts'][mask2][:, 1]
-                        
-                        if len(p1_y) > 0 and len(p2_y) > 0:
-                            y1_mean = np.mean(p1_y)
-                            y2_mean = np.mean(p2_y)
-                            y_dists.append(abs(y1_mean - y2_mean))
-                    
-                    if len(y_dists) > 0 and np.mean(y_dists) > 12.0:
-                        return True
-        return False
-
-    if tem_sobreposicao_vertical_exata(contours_v) or tem_sobreposicao_vertical_exata(contours_p):
-        return 'BHC'
-    
-    return 'Furo'
-
-# =====================================================================
-# 2. FUNÇÃO PRINCIPAL DA INTERFACE
+# 3. INTERFACE STREAMLIT
 # =====================================================================
 def main():
     st.set_page_config(
-        page_title="Detecção automática de defeitos em inspeções de US", 
-        page_icon="logo.png", 
+        page_title="Validação Híbrida YOLO + Modelo Tabular (US)",
+        page_icon="logo.png",
         layout="wide"
     )
 
-    cores_mrs = """
+    css = """
     <style>
-    .block-container { padding-top: 2rem; padding-bottom: 2rem; }
+    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
     .stApp { background-color: #003865; }
-    h1, h2, h3, p, label, .stMarkdown, .stText { color: white !important; }
+    h1, h2, h3, h4, h5, p, label, .stMarkdown, .stText { color: white !important; }
+    .stButton>button, [data-testid="stDownloadButton"] button {
+        background-color: #FFC600; color: #003865 !important; font-weight: bold; border: none; border-radius: 5px;
+    }
+    .stButton>button:hover, [data-testid="stDownloadButton"] button:hover { background-color: #e6b300; color: white !important; }
     .stTabs [data-baseweb="tab-list"] { gap: 20px; }
     .stTabs [data-baseweb="tab"] { background-color: transparent !important; color: #FFC600 !important; }
     .stTabs [aria-selected="true"] { color: white !important; border-bottom-color: #FFC600 !important; }
-    .stButton>button, [data-testid="stDownloadButton"] button {
-        background-color: #FFC600; color: #003865 !important; font-weight: bold; border: none; border-radius: 5px; margin-top: 5px;
-    }
-    .stButton>button:hover, [data-testid="stDownloadButton"] button:hover { background-color: #e6b300; color: white !important; }
-    .stDataFrame { background-color: white; border-radius: 5px; }
-    div.row-widget.stRadio > div{flex-direction:row; justify-content: center;}
-    div.row-widget.stRadio > div > label{
-        background-color: #FFC600; padding: 10px 30px; border-radius: 5px; color:#003865 !important; font-weight: bold; margin-right: 15px; cursor: pointer; border: 2px solid transparent;
-    }
-    div.row-widget.stRadio > div > label[data-checked="true"] {
-        border: 2px solid white; background-color: #e6b300;
-    }
     </style>
     """
-    st.markdown(cores_mrs, unsafe_allow_html=True)
+    st.markdown(css, unsafe_allow_html=True)
 
-    col_logo, col_titulo, col_veiculo = st.columns([1, 4, 1])
-
+    col_logo, col_titulo = st.columns([1, 5])
     with col_logo:
-        try:
-            img_logo = load_image_b64("logo.png")
-            st.markdown(f'<div style="display: flex; justify-content: center; align-items: center; height: 100%; margin-top: 20px;"><img src="data:image/png;base64,{img_logo}" style="width: 160px; height: 110px; object-fit: contain; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);"></div>', unsafe_allow_html=True)
-        except:
-            st.warning("⚠️ Logo não encontrada.")
-            
+        img_logo = load_image_b64('logo.png')
+        if img_logo:
+            st.markdown(f'<img src="data:image/png;base64,{img_logo}" style="width:140px; height:95px; object-fit:contain; border-radius:12px;"/>', unsafe_allow_html=True)
     with col_titulo:
-        st.markdown("<h1 style='text-align: center; margin-top: -10px;'>Detecção Automática de Defeitos em Inspeções de US</h1>", unsafe_allow_html=True)
-        
-    with col_veiculo:
-        try:
-            img_veiculo = load_image_b64("veiculo_us.jpg")
-            st.markdown(f'<div style="display: flex; justify-content: center; align-items: center; height: 100%; margin-top: 20px;"><img src="data:image/jpeg;base64,{img_veiculo}" style="width: 160px; height: 110px; object-fit: cover; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5);"></div>', unsafe_allow_html=True)
-        except:
-            st.warning("⚠️ Imagem do veículo não encontrada.")
+        st.markdown("<h1 style='text-align:center;'>Validação Híbrida de Defeitos US: YOLO + Modelo Tabular</h1>", unsafe_allow_html=True)
+        st.markdown("<p style='text-align:center;'>Os arquivos da pasta <code>modelo/</code> são usados tanto pelo YOLO quanto pelo classificador tabular.</p>", unsafe_allow_html=True)
 
-    st.markdown("<hr style='margin-top: -5px; margin-bottom: 15px;'>", unsafe_allow_html=True)
+    with st.expander("ℹ️ Estrutura esperada da pasta modelo/"):
+        st.code("""modelo/
+  best_alma_3.pt
+  best_boleto_1.pt
+  best_patim_1.pt
+  best_model.joblib
+  vectorizer.json
+  label_encoder.joblib
+""")
 
-    if 'deteccoes' not in st.session_state: st.session_state.deteccoes = []
-    if 'img_gallery' not in st.session_state: st.session_state.img_gallery = []
-    if 'page' not in st.session_state: st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
-    if 'audit_idx' not in st.session_state: st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0} 
-    if 'uploader_key' not in st.session_state: st.session_state.uploader_key = 0 
+    if 'hyb_deteccoes' not in st.session_state:
+        st.session_state.hyb_deteccoes = []
+    if 'hyb_gallery' not in st.session_state:
+        st.session_state.hyb_gallery = []
+    if 'hyb_page' not in st.session_state:
+        st.session_state.hyb_page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
+    if 'hyb_uploader_key' not in st.session_state:
+        st.session_state.hyb_uploader_key = 0
 
     col_upload, col_botoes = st.columns([3, 1])
-
     with col_upload:
         files = st.file_uploader(
-            "Faça o Upload dos arquivos CSV de inspeção brutos", 
-            type=['csv'], 
+            "Faça o upload dos arquivos CSV brutos de inspeção US",
+            type=['csv'],
             accept_multiple_files=True,
-            key=f"uploader_{st.session_state.uploader_key}" 
+            key=f"hyb_uploader_{st.session_state.hyb_uploader_key}"
         )
-        
+
         arquivos_prontos = False
-        
         if files:
-            colunas_esperadas = {'odo', 'frame', 'probe', 'depth', 'sample', 'level'}
+            colunas_esperadas = {'frame', 'probe', 'level'}
             arquivos_validos = True
-            
             for f in files:
                 try:
-                    df_header = pd.read_csv(f, nrows=0)
-                    if not colunas_esperadas.issubset(set(df_header.columns)):
-                        st.error(f"⚠️ **Erro no arquivo:** `{f.name}` - Formato fora do padrão.")
+                    header = pd.read_csv(f, nrows=0)
+                    f.seek(0)
+                    if not colunas_esperadas.issubset(set(header.columns)):
+                        st.error(f"⚠️ O arquivo `{f.name}` não possui o conjunto mínimo de colunas esperado: {colunas_esperadas}")
                         arquivos_validos = False
-                        break 
-                except:
-                    st.error(f"⚠️ **Erro de Leitura:** Não foi possível ler o arquivo `{f.name}`.")
+                        break
+                except Exception:
+                    st.error(f"⚠️ Não foi possível ler o arquivo `{f.name}`.")
                     arquivos_validos = False
                     break
-                    
             if arquivos_validos:
-                st.success(f"✅ {len(files)} arquivo(s) validados! Os ecos serão fisicamente separados por profundidade para análise.")
+                st.success(f"✅ {len(files)} arquivo(s) validados. Pronto para inferência híbrida.")
                 arquivos_prontos = True
 
     with col_botoes:
         st.markdown("<br>", unsafe_allow_html=True)
-        btn_run = st.button("🚀 Iniciar Inferências", type="primary", use_container_width=True, disabled=not arquivos_prontos)
-        
-        if st.button("🧹 Limpar Caixa de Upload", use_container_width=True):
-            st.session_state.uploader_key += 1 
+        btn_run = st.button("🚀 Iniciar inferência híbrida", type='primary', use_container_width=True, disabled=not arquivos_prontos)
+        if st.button("🧹 Limpar upload", use_container_width=True):
+            st.session_state.hyb_uploader_key += 1
             st.rerun()
-
-        if st.button("🗑️ Resetar Sistema", use_container_width=True):
-            st.session_state.deteccoes = []
-            st.session_state.img_gallery = []
-            st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
-            st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
-            st.session_state.uploader_key += 1 
+        if st.button("🗑️ Resetar sistema", use_container_width=True):
+            st.session_state.hyb_deteccoes = []
+            st.session_state.hyb_gallery = []
+            st.session_state.hyb_page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
+            st.session_state.hyb_uploader_key += 1
             st.cache_resource.clear()
-            st.cache_data.clear() 
             st.rerun()
 
     if btn_run and arquivos_prontos:
-        st.session_state.page = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
-        st.session_state.audit_idx = {"Alma": 0, "Boleto": 0, "Patim": 0, "🌐 Visão Global": 0}
-        
         modelos_ativos = {}
         for local_nome, pts in CONFIG_MODELOS.items():
             lista_modelos = []
             for pt_file in pts:
                 m = load_yolo_model(pt_file)
-                if m: lista_modelos.append(m)
+                if m is not None:
+                    lista_modelos.append(m)
             if lista_modelos:
                 modelos_ativos[local_nome] = lista_modelos
-                
+
         if not modelos_ativos:
-            st.error("Nenhum modelo (.pt) encontrado na pasta 'modelo'. Adicione pelo menos um para realizar a inferência.")
+            st.error("Nenhum modelo YOLO (.pt) foi encontrado na pasta 'modelo'.")
             st.stop()
-        
-        progress_bar = st.progress(0.0, text="Concatenando arquivos e aplicando limpeza de ruídos...")
-        
-        for f in files: f.seek(0)
-        df_raw = pd.concat([pd.read_csv(f) for f in files]).sort_values(by='odo')
-        df_raw['odo'] = (df_raw['odo'] * 1000000).astype(int)
-        df_raw = df_raw[df_raw['level'] > 450]
-        df_raw = remover_pontos_isolados(df_raw) 
-        
-        found = []
-        gallery = []
-        
-        total_steps = len(modelos_ativos) * len(range(int(df_raw['odo'].min()), int(df_raw['odo'].max()), 2400))
-        passo_atual = 0
 
-        for local_nome, model_list in modelos_ativos.items():
-            min_depth, max_depth = LIMITES_PROFUNDIDADE.get(local_nome, (0, 223))
-            delta_depth = max_depth - min_depth if (max_depth - min_depth) > 0 else 1
-            
-            df_local = df_raw[(df_raw['depth'] >= min_depth) & (df_raw['depth'] <= max_depth)]
-            if df_local.empty: continue
+        try:
+            vectorizer, model_tab, label_encoder = load_tabular_artifacts()
+        except Exception as e:
+            st.error(f"Erro ao carregar artefatos tabulares de `modelo/`: {e}")
+            st.stop()
 
-            df_esq = df_local[df_local['probe'].isin(SONDAS_ESQUERDA)]
-            df_dir = df_local[df_local['probe'].isin(SONDAS_DIREITA)]
-            lados = [("Trilho_Esq", df_esq), ("Trilho_Dir", df_dir)]
-            
-            for lado_nome, df_side in lados:
-                if df_side.empty: continue
-                
-                side_windows = []
-                side_patim_tdfs = []
-                
-                for start in range(int(df_side['odo'].min()), int(df_side['odo'].max()), 2400):
-                    passo_atual += 1
-                    if total_steps > 0:
-                        progress_bar.progress(min(0.05 + (0.95 * passo_atual / total_steps), 1.0), text=f"Analisando {local_nome} ({lado_nome}): ODO {start}mm...")
-                    
-                    end = start + 2400
-                    df_win = df_side[(df_side['odo'] >= start) & (df_side['odo'] <= end)]
-                    
-                    if len(df_win) > 5:
-                        img_base = generate_bscan_buffer(df_win, start, end, min_depth, max_depth)
-                        img_clean = img_base.copy()
-                        
-                        valid_dets = []
-                        raw_dets = []
-                        h_img, w_img = img_clean.shape[:2]
-                        
-                        for model in model_list:
-                            results = model.predict(img_clean, verbose=False, conf=0.05, iou=0.85)
-                            
-                            if len(results[0].boxes) > 0:
-                                masks_xy = results[0].masks.xy if hasattr(results[0], 'masks') and results[0].masks is not None else [None] * len(results[0].boxes)
-                                
-                                for i, box in enumerate(results[0].boxes):
-                                    mask_u8 = np.zeros((h_img, w_img), dtype=np.uint8)
-                                    poly = masks_xy[i]
-                                    
-                                    if poly is not None and len(poly) > 0:
-                                        cv2.fillPoly(mask_u8, [np.array(poly, dtype=np.int32)], 1)
-                                        
-                                    cls_nome = model.names[int(box.cls)]
-                                    
-                                    if local_nome in ['Boleto', 'Alma'] and cls_nome == 'TDF':
-                                        cls_nome = 'TD'
-                                        
-                                    raw_dets.append({
-                                        'box': box.xyxy[0].cpu().numpy().astype(int),
-                                        'conf': float(box.conf),
-                                        'cls_nome': cls_nome,
-                                        'cls_id': int(box.cls),
-                                        'mask': mask_u8 > 0 
-                                    })
-                                    
-                        if len(raw_dets) > 0:
-                            raw_dets.sort(key=lambda x: x['conf'], reverse=True)
-                            
-                            dets_mescladas = []
-                            for d in raw_dets:
-                                bx1, suprimido = d['box'], False
-                                for f in dets_mescladas:
-                                    bx2 = f['box']
-                                    xl, yt = max(bx1[0], bx2[0]), max(bx1[1], bx2[1])
-                                    xr, yb = min(bx1[2], bx2[2]), min(bx1[3], bx2[3])
-                                    
-                                    if xr > xl and yb > yt:
-                                        area_inter = (xr-xl)*(yb-yt)
-                                        area_min = min((bx1[2]-bx1[0])*(bx1[3]-bx1[1]), (bx2[2]-bx2[0])*(bx2[3]-bx2[1]))
-                                        
-                                        limite_nms = 0.80 if d['cls_nome'] == 'Tala_Isolada' else (0.20 if d['cls_nome'] == 'Furo' else 0.40)
-                                        
-                                        if (area_inter / area_min) > limite_nms:
-                                            if d['cls_nome'] == f['cls_nome']:
-                                                f['box'][0] = min(bx1[0], bx2[0])
-                                                f['box'][1] = min(bx1[1], bx2[1])
-                                                f['box'][2] = max(bx1[2], bx2[2])
-                                                f['box'][3] = max(bx1[3], bx2[3])
-                                                f['mask'] = f['mask'] | d['mask']
-                                            suprimido = True
-                                            break
-                                if not suprimido: 
-                                    dets_mescladas.append(d)
+        try:
+            df_raw = preprocessar_raw(files)
+        except Exception as e:
+            st.error(f"Erro no pré-processamento dos CSVs: {e}")
+            st.stop()
 
-                            for d in dets_mescladas:
-                                x1_orig, y1_orig, x2_orig, y2_orig = d['box']
-                                px1, px2, py1, py2 = x1_orig/w_img, x2_orig/w_img, y1_orig/h_img, y2_orig/h_img
-                                
-                                largura_mm = int(abs(px2 - px1) * 2400)
-                                altura_fisica_ref = {"Alma": 129, "Boleto": 52, "Patim": 43}.get(local_nome, 129)
-                                altura_mm = int(abs(py2 - py1) * altura_fisica_ref)
-                                
-                                # ========================================================
-                                # REGRAS PARA TD (Boleto e Alma)
-                                # ========================================================
-                                if local_nome in ['Boleto', 'Alma'] and d['cls_nome'] == 'TD':
-                                    if altura_mm < 8:
-                                        continue
-                                        
-                                    roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
-                                    roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
-                                    roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
-                                    
-                                    tem_vermelho = np.any(np.all(roi_bgr_mascarado == [0, 0, 255], axis=-1)) 
-                                    tem_azul = np.any(np.all(roi_bgr_mascarado == [255, 0, 0], axis=-1))      
-                                    tem_verde = np.any(np.all(roi_bgr_mascarado == [0, 128, 0], axis=-1))     
-                                    
-                                    if not (tem_vermelho or tem_azul or tem_verde):
-                                        continue
-                                    
-                                    # ========================================================
-                                    # NOVA REGRA: Detecção de Furo Antagônico (Mata Falsos TDs na Alma)
-                                    # ========================================================
-                                    eh_falso_td_furo = False
-                                    if local_nome == 'Alma':
-                                        # Centro X do TD em pixels
-                                        cx = int((x1_orig + x2_orig) / 2.0)
-                                        
-                                        # Distância de 180mm convertida para pixels na imagem (1500px representam 2400mm)
-                                        dx_px = int(180 * (w_img / 2400.0))
-                                        
-                                        # Define a janela horizontal de 180mm para trás e para frente
-                                        x_win_start = max(0, cx - dx_px)
-                                        x_win_end = min(w_img, cx + dx_px)
-                                        
-                                        # Define uma janela vertical folgada pegando a área ao redor da detecção
-                                        y_win_start = max(0, y1_orig - 40)
-                                        y_win_end = min(h_img, y2_orig + 40)
-                                        
-                                        # Extrai o pedaço da imagem limpa e crua onde deve existir o furo
-                                        janela_busca = img_clean[y_win_start:y_win_end, x_win_start:x_win_end]
-                                        
-                                        # Verifica se existem PONTOS VERDES E PONTOS ROXOS simultaneamente nessa janela de 180mm
-                                        lower_green = np.array([0, 100, 0], dtype=np.uint8)
-                                        upper_green = np.array([50, 255, 50], dtype=np.uint8)
-                                        mask_v_antag = cv2.inRange(janela_busca, lower_green, upper_green)
-                                        
-                                        lower_purple = np.array([100, 0, 100], dtype=np.uint8)
-                                        upper_purple = np.array([180, 50, 180], dtype=np.uint8)
-                                        mask_p_antag = cv2.inRange(janela_busca, lower_purple, upper_purple)
-                                        
-                                        if np.any(mask_v_antag) and np.any(mask_p_antag):
-                                            eh_falso_td_furo = True # As duas cores de sondas opostas estão aqui: É um furo.
-                                            
-                                    if eh_falso_td_furo:
-                                        continue # O "continue" aqui destrói a detecção de TD imediatamente
-                                                
-                                    valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
-                                
-                                # Filtro 1: ALMA (Furos)
-                                elif local_nome == 'Alma' and d['cls_nome'] == 'Furo':
-                                    
-                                    center_y_mm_calc = min_depth + delta_depth * (py1 + py2) / 2.0
-                                    if not (80 <= center_y_mm_calc <= 120):
-                                        continue
-                                    
-                                    if largura_mm <= 110 or altura_mm <= 13:
-                                        continue
-                                        
-                                    roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
-                                    roi_mask_bool = d['mask'][y1_orig:y2_orig, x1_orig:x2_orig]
-                                    
-                                    roi_bgr_mascarado = cv2.bitwise_and(roi_bgr, roi_bgr, mask=roi_mask_bool.astype(np.uint8))
-                                    
-                                    lower_green = np.array([0, 100, 0], dtype=np.uint8)
-                                    upper_green = np.array([50, 255, 50], dtype=np.uint8)
-                                    mask_verde = cv2.inRange(roi_bgr_mascarado, lower_green, upper_green)
-
-                                    lower_purple = np.array([100, 0, 100], dtype=np.uint8)
-                                    upper_purple = np.array([180, 50, 180], dtype=np.uint8)
-                                    mask_roxa = cv2.inRange(roi_bgr_mascarado, lower_purple, upper_purple)
-                                    
-                                    kernel = np.ones((3, 3), np.uint8)
-                                    mask_verde_limpa = cv2.erode(mask_verde, kernel, iterations=1)
-                                    mask_roxa_limpa = cv2.erode(mask_roxa, kernel, iterations=1)
-                                    
-                                    tem_verde_furo = np.any(mask_verde_limpa)
-                                    tem_roxo_furo = np.any(mask_roxa_limpa)
-                                    
-                                    if not (tem_verde_furo and tem_roxo_furo):
-                                        continue
-                                    
-                                    classe_refinada = classificar_furo_bhc(roi_bgr, roi_mask_bool)
-                                    d['cls_nome'] = classe_refinada
-                                    
-                                    if classe_refinada == 'BHC':
-                                        d['cls_id'] = 99 
-                                        
-                                    valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
-                                    
-                                # ========================================================
-                                # FILTRO PATIM
-                                # ========================================================
-                                elif local_nome == 'Patim' and d['cls_nome'] == 'TDF':
-                                    if altura_mm >= 6:
-                                        roi_bgr = img_clean[y1_orig:y2_orig, x1_orig:x2_orig]
-                                        tem_verde = np.any(np.all(roi_bgr == [0, 128, 0], axis=-1))
-                                        tem_roxo = np.any(np.all(roi_bgr == [128, 0, 128], axis=-1))
-                                        
-                                        inclinacao_calc = calcular_inclinacao(d['mask'], x1_orig, y1_orig, x2_orig, y2_orig)
-                                        
-                                        center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
-                                        
-                                        side_patim_tdfs.append({
-                                            'd': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 
-                                            'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2,
-                                            'odo': center_x_mm, 'tem_verde': tem_verde, 'tem_roxo': tem_roxo, 
-                                            'inclinacao': inclinacao_calc,
-                                            'usado': False, 'x1': x1_orig, 'y1': y1_orig, 'x2': x2_orig, 'y2': y2_orig,
-                                            'start': start
-                                        })
-                                
-                                else:
-                                    valid_dets.append({'d': d, 'largura_mm': largura_mm, 'altura_mm': altura_mm, 'px1': px1, 'px2': px2, 'py1': py1, 'py2': py2})
-
-                        # ========================================================
-                        # SOBREPOSIÇÃO GEOMÉTRICA NA ALMA (Mantido como segurança)
-                        # ========================================================
-                        if local_nome == 'Alma' and len(valid_dets) > 0:
-                            furo_bhc_boxes = [v['d']['box'] for v in valid_dets if v['d']['cls_nome'] in ['Furo', 'BHC']]
-                            
-                            filtered_dets = []
-                            for v in valid_dets:
-                                manter = True
-                                if v['d']['cls_nome'] == 'TD':
-                                    bx_td = v['d']['box']
-                                    area_td = (bx_td[2] - bx_td[0]) * (bx_td[3] - bx_td[1])
-                                    
-                                    for bx_furo in furo_bhc_boxes:
-                                        xl = max(bx_td[0], bx_furo[0])
-                                        yt = max(bx_td[1], bx_furo[1])
-                                        xr = min(bx_td[2], bx_furo[2])
-                                        yb = min(bx_td[3], bx_furo[3])
-                                        
-                                        if xr > xl and yb > yt:
-                                            inter_area = (xr - xl) * (yb - yt)
-                                            area_furo = (bx_furo[2] - bx_furo[0]) * (bx_furo[3] - bx_furo[1])
-                                            area_min = min(area_td, area_furo)
-                                            
-                                            if (inter_area / area_min) > 0.05:
-                                                manter = False
-                                                break
-                                                
-                                if manter:
-                                    filtered_dets.append(v)
-                            valid_dets = filtered_dets
-
-                        # Salva o frame da janela na lista do lado
-                        side_windows.append({
-                            'start': start,
-                            'img_clean': img_clean,
-                            'other_dets': valid_dets
-                        })
-
-                # ========================================================
-                # ASSOCIAÇÃO GLOBAL: TDF CONJUGADO 
-                # (DUPLAS DE CORES, ALTURA E INCLINAÇÕES ESPECÍFICAS)
-                # ========================================================
-                if local_nome == 'Patim' and side_patim_tdfs:
-                    side_patim_tdfs.sort(key=lambda x: x['odo'])
-                    
-                    for i in range(len(side_patim_tdfs)):
-                        if side_patim_tdfs[i]['usado']: continue
-                        
-                        for j in range(i+1, len(side_patim_tdfs)):
-                            if side_patim_tdfs[j]['usado']: continue
-                            
-                            dist = abs(side_patim_tdfs[j]['odo'] - side_patim_tdfs[i]['odo'])
-                            if dist > 320: break 
-                                
-                            if 200 <= dist <= 300:
-                                v1, r1 = side_patim_tdfs[i]['tem_verde'], side_patim_tdfs[i]['tem_roxo']
-                                v2, r2 = side_patim_tdfs[j]['tem_verde'], side_patim_tdfs[j]['tem_roxo']
-                                h1 = side_patim_tdfs[i]['altura_mm']
-                                h2 = side_patim_tdfs[j]['altura_mm']
-                                inc1 = side_patim_tdfs[i]['inclinacao']
-                                inc2 = side_patim_tdfs[j]['inclinacao']
-                                
-                                cores_validas = ((v1 and r2) or (r1 and v2))
-                                altura_valida = (h1 >= 10 or h2 >= 10)
-                                inclinacao_valida = (inc1 == "Direita" and inc2 == "Esquerda")
-                                
-                                par_valido = cores_validas and altura_valida and inclinacao_valida
-                                
-                                if par_valido:
-                                    side_patim_tdfs[i]['usado'] = True
-                                    side_patim_tdfs[j]['usado'] = True
-                                    dist_inteiro = int(dist) 
-                                    
-                                    if side_patim_tdfs[i]['start'] == side_patim_tdfs[j]['start']:
-                                        d1, d2 = side_patim_tdfs[i]['d'], side_patim_tdfs[j]['d']
-                                        new_x1 = min(side_patim_tdfs[i]['x1'], side_patim_tdfs[j]['x1'])
-                                        new_y1 = min(side_patim_tdfs[i]['y1'], side_patim_tdfs[j]['y1'])
-                                        new_x2 = max(side_patim_tdfs[i]['x2'], side_patim_tdfs[j]['x2'])
-                                        new_y2 = max(side_patim_tdfs[i]['y2'], side_patim_tdfs[j]['y2'])
-                                        
-                                        new_d = d1.copy()
-                                        new_d['box'] = np.array([new_x1, new_y1, new_x2, new_y2])
-                                        new_d['mask'] = d1['mask'] | d2['mask']
-                                        new_d['cls_nome'] = 'TDF_Conjugado'
-                                        new_d['dist_par'] = dist_inteiro 
-                                        
-                                        h_img, w_img = side_windows[0]['img_clean'].shape[:2]
-                                        n_px1, n_px2 = new_x1/w_img, new_x2/w_img
-                                        n_py1, n_py2 = new_y1/h_img, new_y2/h_img
-                                        n_largura_mm = int(abs(n_px2 - n_px1) * 2400)
-                                        n_altura_mm = int(abs(n_py2 - n_py1) * 43)
-                                        
-                                        for w in side_windows:
-                                            if w['start'] == side_patim_tdfs[i]['start']:
-                                                w['other_dets'].append({'d': new_d, 'largura_mm': n_largura_mm, 'altura_mm': n_altura_mm, 'px1': n_px1, 'px2': n_px2, 'py1': n_py1, 'py2': n_py2})
-                                                break
-                                    else:
-                                        side_patim_tdfs[i]['d']['cls_nome'] = 'TDF_Conjugado'
-                                        side_patim_tdfs[i]['d']['dist_par'] = dist_inteiro
-                                        side_patim_tdfs[j]['d']['cls_nome'] = 'TDF_Conjugado'
-                                        side_patim_tdfs[j]['d']['dist_par'] = dist_inteiro
-                                        
-                                        for w in side_windows:
-                                            if w['start'] == side_patim_tdfs[i]['start']:
-                                                w['other_dets'].append({'d': side_patim_tdfs[i]['d'], 'largura_mm': side_patim_tdfs[i]['largura_mm'], 'altura_mm': side_patim_tdfs[i]['altura_mm'], 'px1': side_patim_tdfs[i]['px1'], 'px2': side_patim_tdfs[i]['px2'], 'py1': side_patim_tdfs[i]['py1'], 'py2': side_patim_tdfs[i]['py2']})
-                                            if w['start'] == side_patim_tdfs[j]['start']:
-                                                w['other_dets'].append({'d': side_patim_tdfs[j]['d'], 'largura_mm': side_patim_tdfs[j]['largura_mm'], 'altura_mm': side_patim_tdfs[j]['altura_mm'], 'px1': side_patim_tdfs[j]['px1'], 'px2': side_patim_tdfs[j]['px2'], 'py1': side_patim_tdfs[j]['py1'], 'py2': side_patim_tdfs[j]['py2']})
-                                    break
-                                    
-                    # Re-adiciona TDFs isolados restantes (desde que sejam > 18mm)
-                    for item in side_patim_tdfs:
-                        if not item['usado']:
-                            if item['altura_mm'] > 18:
-                                for w in side_windows:
-                                    if w['start'] == item['start']:
-                                        w['other_dets'].append({'d': item['d'], 'largura_mm': item['largura_mm'], 'altura_mm': item['altura_mm'], 'px1': item['px1'], 'px2': item['px2'], 'py1': item['py1'], 'py2': item['py2']})
-                                        break
-                                        
-                # ========================================================
-                # RENDERIZAÇÃO FINAL E SALVAMENTO NA GALERIA
-                # ========================================================
-                for w in side_windows:
-                    if len(w['other_dets']) > 0:
-                        start = w['start']
-                        img_clean = w['img_clean']
-                        valid_dets = w['other_dets']
-                        
-                        VIS_W, VIS_H = 2400, 400
-                        img_draw = cv2.resize(img_clean, (VIS_W, VIS_H), interpolation=cv2.INTER_LINEAR)
-                        h_img, w_img = img_clean.shape[:2]
-                        
-                        for local_id, det_info in enumerate(valid_dets, 1):
-                            d = det_info['d']
-                            largura_mm = det_info['largura_mm']
-                            altura_mm = det_info['altura_mm']
-                            px1, px2, py1, py2 = det_info['px1'], det_info['px2'], det_info['py1'], det_info['py2']
-                            
-                            x1_orig, y1_orig, x2_orig, y2_orig = d['box']
-                            area_caixa = max(1, x2_orig - x1_orig) * max(1, y2_orig - y1_orig)
-                            
-                            x1 = int((x1_orig / w_img) * VIS_W)
-                            y1 = int((y1_orig / h_img) * VIS_H)
-                            x2 = int((x2_orig / w_img) * VIS_W)
-                            y2 = int((y2_orig / h_img) * VIS_H)
-                            
-                            cor_bbox = (255, 0, 255) if d['cls_nome'] == 'BHC' else (0, 255, 255) if d['cls_nome'] == 'TDF_Conjugado' else (0, 0, 255)
-                            cv2.rectangle(img_draw, (x1, y1), (x2, y2), cor_bbox, 2)
-                            
-                            lbl_text = f"#{local_id} {d['cls_nome']}"
-                            if 'dist_par' in d:
-                                lbl_text += f" ({d['dist_par']}mm)"
-                                
-                            cv2.putText(img_draw, lbl_text, (x1+2, max(15, y1-7)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-                            
-                            center_x_mm = (start + int(2400 * px1) + start + int(2400 * px2)) / 2
-                            center_y_mm = (min_depth + int(delta_depth * py1) + min_depth + int(delta_depth * py2)) / 2
-                            
-                            found.append({
-                                'ID_Global': len(found), 
-                                'ID_Img': f"#{local_id}", 
-                                'Local': local_nome, 
-                                'Lado': lado_nome, 
-                                'Classe': d['cls_nome'], 
-                                'ODO': int(center_x_mm),
-                                'ODO_Ref': start,
-                                'Coordenada Depth(mm)': int(center_y_mm),
-                                'Largura(mm)': largura_mm,
-                                'Altura(mm)': altura_mm,
-                                'Área (px)': int(area_caixa),
-                                'Confiança': f"{d['conf']:.2%}", 
-                                'Aprovado': True,
-                                'yolo_bbox': f"{d['cls_id']} {((x1_orig+x2_orig)/2)/w_img:.6f} {((y1_orig+y2_orig)/2)/h_img:.6f} {(x2_orig-x1_orig)/w_img:.6f} {(y2_orig-y1_orig)/h_img:.6f}"
-                            })
-                        gallery.append({"img": img_draw, "img_clean": img_clean, "label": f"{lado_nome} @ {start}", "odo_ref": start, "lado": lado_nome, "local": local_nome})
-        
-        progress_bar.progress(1.0, text="✅ Processamento concluído!")
-        
+        found, gallery = detectar_e_validar(df_raw, modelos_ativos, vectorizer, model_tab, label_encoder)
         if found:
-            st.session_state.deteccoes = found
-            st.session_state.img_gallery = gallery
+            st.session_state.hyb_deteccoes = found
+            st.session_state.hyb_gallery = gallery
             st.rerun()
         else:
-            st.info("A inferência foi processada com sucesso, mas a rede neural não encontrou nenhum defeito nas imagens geradas.")
+            st.info("A inferência híbrida foi concluída, mas nenhuma detecção foi validada pelo modelo tabular.")
 
-    if st.session_state.deteccoes or st.session_state.img_gallery:
-        st.markdown("<hr style='margin-top: 5px; margin-bottom: 5px;'>", unsafe_allow_html=True)
-        
-        df_raw = pd.DataFrame(st.session_state.deteccoes) if st.session_state.deteccoes else pd.DataFrame(columns=['Local', 'Aprovado', 'ID_Global', 'ID_Img'])
-        
-        if not df_raw.empty and 'Local' not in df_raw.columns: df_raw['Local'] = "Alma" 
-        if not df_raw.empty and 'Aprovado' not in df_raw.columns: df_raw['Aprovado'] = True
-        if not df_raw.empty and 'ID_Global' not in df_raw.columns: df_raw['ID_Global'] = df_raw.index
-            
-        st.markdown("<h4 style='color: #FFC600; text-align: center;'>Alternar Visualização de Tabelas e Modelos:</h4>", unsafe_allow_html=True)
-        
+    if st.session_state.hyb_deteccoes or st.session_state.hyb_gallery:
+        st.markdown("<hr>", unsafe_allow_html=True)
+        df_raw = pd.DataFrame(st.session_state.hyb_deteccoes) if st.session_state.hyb_deteccoes else pd.DataFrame()
+        if not df_raw.empty:
+            if 'Aprovado' not in df_raw.columns:
+                df_raw['Aprovado'] = True
+            if 'Local' not in df_raw.columns:
+                df_raw['Local'] = 'Alma'
+
+        st.markdown("<h4 style='color:#FFC600; text-align:center;'>Alternar visualização:</h4>", unsafe_allow_html=True)
         locais_fixos = ["Alma", "Boleto", "Patim", "🌐 Visão Global"]
         local_selecionado = st.radio("Selecione:", locais_fixos, horizontal=True, label_visibility="collapsed")
-        
+
         if local_selecionado == "🌐 Visão Global":
-            aba_dados = st.tabs(["📊 Tabelas e Relatório Global"])[0]
-            with aba_dados:
-                col_resumo, col_filtros = st.columns([1, 2])
-                df_aprovados_global = df_raw[df_raw['Aprovado'] == True].copy() if not df_raw.empty else pd.DataFrame()
-                
-                with col_resumo:
-                    st.markdown("##### 📈 Resumo Geral (Aprovados)")
-                    if not df_aprovados_global.empty:
-                        contagem_classes = df_aprovados_global['Classe'].value_counts().reset_index()
-                        contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True)
-                    else:
-                        st.info("Nenhum defeito aprovado na via toda.")
-                
-                with col_filtros:
-                    st.markdown("##### 🔍 Refinar Busca Global")
-                    cf1, cf2, cf3 = st.columns(3)
-                    with cf1:
-                        classes_disp = df_aprovados_global['Classe'].unique() if not df_aprovados_global.empty else []
-                        filtro_classe = st.multiselect("Classe:", options=classes_disp, default=classes_disp)
-                    with cf2:
-                        lados_disp = df_aprovados_global['Lado'].unique() if not df_aprovados_global.empty else []
-                        filtro_lado = st.multiselect("Lado:", options=lados_disp, default=lados_disp)
-                    with cf3:
-                        loc_disp = df_aprovados_global['Local'].unique() if not df_aprovados_global.empty else []
-                        filtro_local = st.multiselect("Local:", options=loc_disp, default=loc_disp)
-                        
-                if not df_aprovados_global.empty:
-                    df_filtrado_global = df_aprovados_global[
-                        (df_aprovados_global['Classe'].isin(filtro_classe)) & 
-                        (df_aprovados_global['Lado'].isin(filtro_lado)) &
-                        (df_aprovados_global['Local'].isin(filtro_local))
-                    ]
-                    
-                    colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
-                    df_final_export = df_filtrado_global.drop(columns=colunas_esconder, errors='ignore')
-                    
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    st.dataframe(df_final_export, hide_index=True)
-                    
-                    st.markdown("<hr>", unsafe_allow_html=True)
-                    col_down, _ = st.columns([1, 2])
-                    with col_down:
-                        output = io.BytesIO()
-                        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                            df_final_export.to_excel(writer, index=False, sheet_name='Defeitos_US_Globais')
-                        excel_data = output.getvalue()
-                        
-                        st.download_button(
-                            label="📥 Baixar Relatório Unificado (Excel)", 
-                            data=excel_data, 
-                            file_name=f"relatorio_us_unificado_{datetime.now().strftime('%d%m%H%M')}.xlsx", 
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            use_container_width=True,
-                            type="primary"
-                        )
-        else:
-            df_local_atual = df_raw[df_raw['Local'] == local_selecionado].copy() if not df_raw.empty else pd.DataFrame()
-            galeria_local_atual = [item for item in st.session_state.img_gallery if item.get('local') == local_selecionado]
-            
-            if local_selecionado not in st.session_state.audit_idx: st.session_state.audit_idx[local_selecionado] = 0
-            if local_selecionado not in st.session_state.page: st.session_state.page[local_selecionado] = 0
-            
-            colunas_esconder = ['ID_Global', 'Aprovado', 'ID_Img', 'yolo_bbox']
-            df_aprovados_local = df_local_atual[df_local_atual['Aprovado'] == True].drop(columns=colunas_esconder, errors='ignore') if not df_local_atual.empty else pd.DataFrame()
-            
-            aba_dados, aba_auditoria, aba_galeria = st.tabs(["📊 Tabelas e Filtros", "✅ Auditoria & Retreinamento", "🖼️ Galeria Geral"])
-            
-            with aba_dados:
-                col_resumo, col_filtros = st.columns([1, 2])
-                with col_resumo:
-                    st.markdown(f"##### 📈 Resumo - {local_selecionado} (Aprovados)")
-                    if not df_aprovados_local.empty:
-                        contagem_classes = df_aprovados_local['Classe'].value_counts().reset_index()
-                        contagem_classes.columns = ['Tipo de Defeito', 'Quantidade']
-                        st.dataframe(contagem_classes, hide_index=True)
-                    else:
-                        st.info(f"Nenhum defeito aprovado em {local_selecionado} no momento.")
-                    
-                with col_filtros:
-                    st.markdown("##### 🔍 Refinar Busca")
-                    cf1, cf2 = st.columns(2)
-                    with cf1:
-                        classes_disp = df_aprovados_local['Classe'].unique() if not df_aprovados_local.empty else []
-                        filtro_classe = st.multiselect("Filtrar por Classe:", options=classes_disp, default=classes_disp)
-                    with cf2:
-                        lados_disp = df_aprovados_local['Lado'].unique() if not df_aprovados_local.empty else []
-                        filtro_lado = st.multiselect("Filtrar por Lado:", options=lados_disp, default=lados_disp)
-                        
-                if not df_aprovados_local.empty:
-                    df_filtrado_local = df_aprovados_local[(df_aprovados_local['Classe'].isin(filtro_classe)) & (df_aprovados_local['Lado'].isin(filtro_lado))]
-                    st.markdown("<br>", unsafe_allow_html=True)
-                    st.dataframe(df_filtrado_local, hide_index=True)
+            tab_global = st.tabs(["📊 Relatório Global", "📦 Downloads"])
+            with tab_global[0]:
+                if not df_raw.empty:
+                    df_aprov = df_raw[df_raw['Aprovado'] == True].copy()
+                    st.markdown("##### Resumo Global (aprovados)")
+                    contagem = df_aprov['Classe_Tabular'].value_counts().reset_index()
+                    contagem.columns = ['Classe tabular validada', 'Quantidade']
+                    st.dataframe(contagem, hide_index=True, use_container_width=True)
 
-            with aba_auditoria:
-                total_imagens_det = len(galeria_local_atual)
-                if total_imagens_det > 0:
-                    col_nav_esq, col_nav_centro, col_nav_dir = st.columns([1, 2, 1])
-                    with col_nav_esq:
-                        if st.session_state.audit_idx[local_selecionado] > 0:
-                            if st.button("⬅️ Imagem Anterior", use_container_width=True, key="btn_prev"):
-                                st.session_state.audit_idx[local_selecionado] -= 1
-                                st.rerun()
-                    with col_nav_centro:
-                        st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Imagem {st.session_state.audit_idx[local_selecionado] + 1} de {total_imagens_det} ({local_selecionado})</h5>", unsafe_allow_html=True)
-                    with col_nav_dir:
-                        if st.session_state.audit_idx[local_selecionado] < total_imagens_det - 1:
-                            if st.button("Próxima Imagem ➡️", use_container_width=True, key="btn_next"):
-                                st.session_state.audit_idx[local_selecionado] += 1
-                                st.rerun()
-                    
-                    img_idx = st.session_state.audit_idx[local_selecionado]
-                    img_atual = galeria_local_atual[img_idx]
-                    
-                    st.markdown("<br>", unsafe_allow_html=True) 
-                    col_esq, col_dir = st.columns([3, 2])
-                    
-                    with col_esq:
-                        st.image(img_atual['img'], channels="BGR")
-                        st.caption(f"Visualizando: {img_atual['label']}")
-                        
-                    with col_dir:
-                        st.markdown("#### Validar Detecções")
-                        mask = (df_raw['ODO_Ref'] == img_atual['odo_ref']) & (df_raw['Lado'] == img_atual['lado']) & (df_raw['Local'] == local_selecionado)
-                        df_imagem_atual = df_raw[mask].copy()
-                        
-                        if not df_imagem_atual.empty:
-                            edited_df = st.data_editor(
-                                df_imagem_atual[['ID_Global', 'ID_Img', 'Classe', 'ODO', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)', 'Aprovado']],
-                                column_config={
-                                    "Aprovado": st.column_config.CheckboxColumn("✅ Aprovado?", default=True),
-                                    "ID_Global": None, 
-                                    "ID_Img": st.column_config.TextColumn("Ref")
-                                },
-                                disabled=['ID_Img', 'Classe', 'ODO', 'Coordenada Depth(mm)', 'Área (px)', 'Confiança', 'Largura(mm)', 'Altura(mm)'], 
-                                hide_index=True,
-                                key=f"editor_img_{local_selecionado}_{img_idx}" 
-                            )
-                            
-                            for _, row in edited_df.iterrows():
-                                g_id = int(row['ID_Global'])
-                                if st.session_state.deteccoes[g_id].get('Aprovado', True) != row['Aprovado']:
-                                    st.session_state.deteccoes[g_id]['Aprovado'] = row['Aprovado']
-                                    st.rerun() 
-                        else:
-                            st.info("Esta imagem não possui detecções ativas. Serve como negative mining no retreinamento.")
-                    
-                    st.markdown("<br><hr>", unsafe_allow_html=True)
-                    st.markdown("#### 📦 Exportar Dataset Estruturado para Retreinamento")
-                    
-                    if 'img_clean' in st.session_state.img_gallery[0]:
-                        st.download_button(
-                            label="⬇️ Baixar Dataset Global Estruturado",
-                            data=gerar_zip_dataset(),
-                            file_name=f"dataset_multi_retreino_{datetime.now().strftime('%d%m%H%M')}.zip",
-                            mime="application/zip",
-                            use_container_width=True
-                        )
+                    st.markdown("##### Relatório consolidado")
+                    colunas = ['Local','Lado','Classe_YOLO','Classe_Tabular','ODO','Coordenada Depth(mm)','Largura(mm)','Altura(mm)','Confiança_YOLO','Confiança_Tabular','Rows_Região_Tabular']
+                    st.dataframe(df_aprov[colunas], hide_index=True, use_container_width=True)
                 else:
-                    if local_selecionado == "Patim":
-                        st.info("⚠️ O modelo do Patim não está carregado ou os arquivos não possuem dados dessa região.")
-                    else:
-                        st.info(f"Nenhuma imagem correspondente a {local_selecionado} para auditar.")
+                    st.info('Nenhuma detecção aprovada disponível.')
 
-            with aba_galeria:
-                st.markdown("##### Dica: Passe o mouse sobre a imagem e clique no ícone de expansão para tela cheia.")
-                itens_por_pagina = 20
-                total_paginas = max(1, (len(galeria_local_atual) - 1) // itens_por_pagina + 1) if len(galeria_local_atual) > 0 else 1
-                
-                if st.session_state.page[local_selecionado] >= total_paginas:
-                    st.session_state.page[local_selecionado] = 0
-                    
-                inicio_idx = st.session_state.page[local_selecionado] * itens_por_pagina
-                fim_idx = inicio_idx + itens_por_pagina
-                imagens_atuais = galeria_local_atual[inicio_idx:fim_idx]
-                
-                cols = st.columns(3) 
-                for idx, item in enumerate(imagens_atuais):
-                    with cols[idx % 3]:
-                        st.image(item['img'], channels="BGR")
-                        odo_val = item['label'].split('@')[1].strip()
-                        st.markdown(f"<div style='text-align: center; color: #FFC600; font-weight: bold; margin-top: -10px; margin-bottom: 15px;'>ODO: {odo_val}</div>", unsafe_allow_html=True)
-                
-                if total_paginas > 1:
-                    st.write("") 
-                    col_pg_esq, col_pg_centro, col_pg_dir = st.columns([1, 2, 1])
-                    with col_pg_esq:
-                        if st.session_state.page[local_selecionado] > 0:
-                            if st.button("⬅️ Anterior", use_container_width=True, key="pg_gal_prev"):
-                                st.session_state.page[local_selecionado] -= 1
-                                st.rerun()
-                    with col_pg_centro:
-                        st.markdown(f"<h5 style='text-align: center; color: white; margin-top: 10px;'>Página {st.session_state.page[local_selecionado] + 1} de {total_paginas}</h5>", unsafe_allow_html=True)
-                    with col_pg_dir:
-                        if st.session_state.page[local_selecionado] < total_paginas - 1:
-                            if st.button("Próxima ➡️", use_container_width=True, key="pg_gal_next"):
-                                st.session_state.page[local_selecionado] += 1
-                                st.rerun()
+            with tab_global[1]:
+                if not df_raw.empty:
+                    excel_data = generate_excel_report(df_raw)
+                    st.download_button(
+                        label="📥 Baixar relatório híbrido (Excel)",
+                        data=excel_data,
+                        file_name=f"relatorio_hibrido_yolo_tabular_{datetime.now().strftime('%d%m%Y_%H%M')}.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
+                if st.session_state.hyb_gallery:
+                    zip_imgs = generate_zip_of_annotated_images(st.session_state.hyb_gallery)
+                    st.download_button(
+                        label="🖼️ Baixar imagens anotadas (ZIP)",
+                        data=zip_imgs,
+                        file_name=f"imagens_anotadas_hibridas_{datetime.now().strftime('%d%m%Y_%H%M')}.zip",
+                        mime="application/zip",
+                        use_container_width=True
+                    )
+        else:
+            df_local = df_raw[df_raw['Local'] == local_selecionado].copy() if not df_raw.empty else pd.DataFrame()
+            gal_local = [g for g in st.session_state.hyb_gallery if g.get('local') == local_selecionado]
 
-# =====================================================================
-# 3. GATILHO DE EXECUÇÃO PRINCIPAL
-# =====================================================================
+            tabs = st.tabs(["📊 Tabela", "🖼️ Galeria"])
+            with tabs[0]:
+                if not df_local.empty:
+                    st.markdown(f"##### Detecções validadas - {local_selecionado}")
+                    colunas = ['Lado','Classe_YOLO','Classe_Tabular','ODO','Coordenada Depth(mm)','Largura(mm)','Altura(mm)','Confiança_YOLO','Confiança_Tabular','Rows_Região_Tabular']
+                    st.dataframe(df_local[colunas], hide_index=True, use_container_width=True)
+                else:
+                    st.info(f"Nenhuma detecção validada em {local_selecionado}.")
+
+            with tabs[1]:
+                st.markdown("##### Galeria de imagens anotadas")
+                if not gal_local:
+                    st.info(f"Nenhuma imagem disponível em {local_selecionado}.")
+                else:
+                    itens_por_pagina = 12
+                    total_pag = max(1, math.ceil(len(gal_local) / itens_por_pagina))
+                    if st.session_state.hyb_page[local_selecionado] >= total_pag:
+                        st.session_state.hyb_page[local_selecionado] = 0
+                    ini = st.session_state.hyb_page[local_selecionado] * itens_por_pagina
+                    fim = ini + itens_por_pagina
+                    subset = gal_local[ini:fim]
+                    cols = st.columns(3)
+                    for idx, item in enumerate(subset):
+                        with cols[idx % 3]:
+                            st.image(item['img'], channels='BGR')
+                            st.caption(item['label'])
+                    if total_pag > 1:
+                        c1, c2, c3 = st.columns([1, 2, 1])
+                        with c1:
+                            if st.session_state.hyb_page[local_selecionado] > 0:
+                                if st.button('⬅️ Anterior', key=f'prev_{local_selecionado}', use_container_width=True):
+                                    st.session_state.hyb_page[local_selecionado] -= 1
+                                    st.rerun()
+                        with c2:
+                            st.markdown(f"<p style='text-align:center;'>Página {st.session_state.hyb_page[local_selecionado] + 1} de {total_pag}</p>", unsafe_allow_html=True)
+                        with c3:
+                            if st.session_state.hyb_page[local_selecionado] < total_pag - 1:
+                                if st.button('Próxima ➡️', key=f'next_{local_selecionado}', use_container_width=True):
+                                    st.session_state.hyb_page[local_selecionado] += 1
+                                    st.rerun()
+
 if __name__ == "__main__":
     main()
