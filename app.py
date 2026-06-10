@@ -5,7 +5,6 @@ import io
 import math
 import zipfile
 import tempfile
-import subprocess
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
@@ -22,21 +21,6 @@ os.environ['YOLO_TELEMETRY'] = 'False'
 os.environ['YOLO_UPDATE_CHECK'] = 'False'
 os.environ['YOLO_SYNC'] = 'False'
 
-# =====================================================================
-# 0. AUTO-INSTALAÇÃO DE DEPENDÊNCIAS (opcional)
-# =====================================================================
-def install_dependencies():
-    if os.path.exists("requirements.txt"):
-        try:
-            if 'dependencies_installed_hybrid_modelo' not in os.environ:
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
-                os.environ['dependencies_installed_hybrid_modelo'] = '1'
-        except Exception as e:
-            print(f"Erro ao instalar dependências: {e}")
-
-if __name__ == "__main__":
-    install_dependencies()
-
 import cv2
 import joblib
 import numpy as np
@@ -45,8 +29,6 @@ import streamlit as st
 from ultralytics import YOLO
 from scipy.spatial import cKDTree
 
-# Permite importar o vetor tabular já criado anteriormente, assumindo que o arquivo
-# pipeline_tabular_us_2026_revisado.py está no mesmo diretório deste app.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
